@@ -33,7 +33,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.File
-import java.io.FileOutputStream
 
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
@@ -51,7 +50,7 @@ class OverlayService : Service() {
     private val depths = intArrayOf(1, 3, 4)
     private val handler = Handler(Looper.getMainLooper())
 
-    // захват экрана
+    // захват экрана (кадры живут только в оперативной памяти)
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var vdisplay: VirtualDisplay? = null
@@ -75,6 +74,18 @@ class OverlayService : Service() {
     }
 
     override fun onBind(i: Intent?): IBinder? = null
+
+    /** Удаляем last_board.png, если он остался от прошлых версий. Новые версии скриншоты на диск не пишут. */
+    private fun cleanupOldScreens() {
+        try {
+            File(getExternalFilesDir(null) ?: filesDir, "last_board.png").delete()
+        } catch (e: Exception) {
+        }
+        try {
+            File(filesDir, "last_board.png").delete()
+        } catch (e: Exception) {
+        }
+    }
 
     private fun buildNotif(): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -108,7 +119,8 @@ class OverlayService : Service() {
         prefs = getSharedPreferences("chess_overlay", Context.MODE_PRIVATE)
         playWhite = prefs.getBoolean("playWhite", true)
         level = prefs.getInt("level", 1).coerceIn(0, 2)
-        BoardRecognizer.loadTemplates(prefs)
+        cleanupOldScreens()
+        BoardRecognizer.loadTemplates(prefs) // эталоны фигур остаются после перезапуска
         buildArrow()
         buildBubble()
         buildMenu()
@@ -215,12 +227,12 @@ class OverlayService : Service() {
         makeDraggable(bubble, bubbleLp, bubble) { toggleMenu() }
     }
 
-    private fun btn(t: String, click: () -> Unit) = Button(this).apply {
+    private fun btn(t: String, color: String = "#FF3A3A3A", click: () -> Unit) = Button(this).apply {
         text = t
         isAllCaps = false
-        textSize = 13f
+        textSize = 12f
         setTextColor(Color.WHITE)
-        background = roundBg(Color.parseColor("#FF3A3A3A"), 10)
+        background = roundBg(Color.parseColor(color), 10)
         minHeight = 0
         minimumHeight = dp(38)
         setPadding(dp(6), 0, dp(6), 0)
@@ -294,22 +306,28 @@ class OverlayService : Service() {
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 3f))
         content.addView(row1)
 
-        // строка 2: кнопки
-        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         fun lpB(w: Float): LinearLayout.LayoutParams {
             val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, w)
             lp.setMargins(dp(2), dp(6), dp(2), dp(2))
             return lp
         }
+
+        // строка 2: настройка
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row2.addView(btn("Запомнить эталоны") { learnTemplates() }, lpB(1.8f))
         row2.addView(btn("Доска") { startBoardSelect() }, lpB(1f))
-        row2.addView(btn("Сканировать") { scan() }, lpB(1.4f))
         row2.addView(btn("Закрыть") { stopSelf() }, lpB(1f))
         content.addView(row2)
+
+        // строка 3: главная кнопка
+        val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row3.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1f))
+        content.addView(row3)
 
         status = TextView(this).apply {
             textSize = 11f
             setTextColor(Color.WHITE)
-            maxLines = 4
+            maxLines = 5
             setPadding(dp(2), dp(2), dp(2), 0)
         }
         content.addView(status)
@@ -319,7 +337,7 @@ class OverlayService : Service() {
         val sz = realSize()
         menuLp = params(sz[0] - dp(16), WindowManager.LayoutParams.WRAP_CONTENT, f)
         menuLp.x = dp(8)
-        menuLp.y = sz[1] - dp(190)
+        menuLp.y = sz[1] - dp(250)
         wm.addView(menu, menuLp)
         makeVDraggable(handle, menuLp, menu)
     }
@@ -405,7 +423,7 @@ class OverlayService : Service() {
             )
             projection = mp
             reader = ir
-            status.text = "Захват экрана включён. Открой Chess.com и нажми «Сканировать»"
+            status.text = "Захват экрана включён. Открой Chess.com и нажми нужную кнопку"
         } catch (e: Exception) {
             status.text = "Ошибка захвата: ${e.message}"
         }
@@ -439,7 +457,7 @@ class OverlayService : Service() {
         }
     }
 
-    /** Прячет UI на 500 мс, берёт свежий кадр и вырезает область доски. */
+    /** Прячет UI на 500 мс, берёт свежий кадр и вырезает область доски. Всё в памяти, на диск ничего не пишется. */
     private fun captureBoard(done: (Bitmap?, String) -> Unit) {
         if (reader == null) {
             done(null, "Захват экрана не включён.")
@@ -479,37 +497,65 @@ class OverlayService : Service() {
         } catch (e: Exception) {
             bmp = null
         } finally {
-            cur.close()
+            cur.close() // кадр освобождён сразу
         }
         setUiVisible(true) // всё возвращается на место
         val out = bmp
-        if (out == null) {
-            done(null, "Ошибка скриншота.")
-            return
-        }
-        Thread {
-            try {
-                val f = File(getExternalFilesDir(null) ?: filesDir, "last_board.png")
-                FileOutputStream(f).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            } catch (e: Exception) {
-            }
-        }.start()
-        done(out, "")
+        if (out == null) done(null, "Ошибка скриншота.") else done(out, "")
     }
 
-    // ---------- сканирование ----------
+    // ---------- общие проверки перед снимком ----------
 
-    private fun scan() {
-        if (busy) return
+    private fun prepare(): Boolean {
+        if (busy) return false
         if (hasBoard().not()) {
             status.text = "Сначала нажми «Доска» и проведи пальцем сверху вниз."
-            return
+            return false
         }
         if (reader == null) {
             requestCapture()
-            status.text = "Разреши захват экрана и снова нажми «Сканировать»."
+            status.text = "Разреши захват экрана и снова нажми кнопку."
+            return false
+        }
+        return true
+    }
+
+    // ---------- «Запомнить эталоны» ----------
+
+    private fun learnTemplates() {
+        if (prepare().not()) return
+        busy = true
+        arrow.move = null
+        arrow.invalidate()
+        status.text = "Скриншот..."
+        captureBoard { bmp, msg ->
+            if (bmp == null) {
+                busy = false
+                status.text = msg
+            } else {
+                status.text = "Запоминаю эталоны..."
+                val white = playWhite
+                Thread {
+                    val rec = BoardRecognizer.learn(bmp, white, prefs)
+                    bmp.recycle() // скриншот удалён из памяти
+                    handler.post {
+                        status.text = rec.msg
+                        busy = false
+                    }
+                }.start()
+            }
+        }
+    }
+
+    // ---------- «Сканировать» ----------
+
+    private fun scan() {
+        if (busy) return
+        if (BoardRecognizer.hasTemplates().not()) {
+            status.text = "Сначала нажми \"Запомнить эталоны\""
             return
         }
+        if (prepare().not()) return
         busy = true
         arrow.move = null
         arrow.invalidate()
@@ -528,7 +574,8 @@ class OverlayService : Service() {
     private fun recognizeAndPlay(bmp: Bitmap) {
         val white = playWhite
         Thread {
-            val rec = BoardRecognizer.recognize(bmp, white, prefs)
+            val rec = BoardRecognizer.recognize(bmp, white)
+            bmp.recycle() // распознали — скриншот сразу удаляем из памяти
             handler.post {
                 val fen = rec.fen
                 val pos = if (fen != null) Position.fromFen(fen) else null
@@ -565,6 +612,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         releaseProjection()
+        cleanupOldScreens()
         try {
             projection?.stop()
         } catch (e: Exception) {
