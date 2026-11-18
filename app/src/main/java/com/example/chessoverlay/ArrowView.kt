@@ -9,9 +9,28 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.sin
+
+/**
+ * Доска по верхней и нижней границе (проведён один вертикальный свайп).
+ * Если высота ≈ ширине экрана — доска на всю ширину (квадрат по центру свайпа).
+ * Иначе — квадрат со стороной = высоте свайпа, по центру экрана.
+ */
+fun boardFromBand(y1: Float, y2: Float, screenW: Float): RectF {
+    val top = minOf(y1, y2)
+    val bottom = maxOf(y1, y2)
+    val h = bottom - top
+    return if (h >= screenW * 0.85f) {
+        val t = ((top + bottom) / 2f - screenW / 2f).coerceAtLeast(0f)
+        RectF(0f, t, screenW, t + screenW)
+    } else {
+        val left = (screenW - h) / 2f
+        RectF(left, top, left + h, bottom)
+    }
+}
 
 /** Рисует стрелку лучшего хода поверх доски. flip=true — доска перевёрнута (играем за чёрных). */
 class ArrowView(ctx: Context) : View(ctx) {
@@ -48,7 +67,6 @@ class ArrowView(ctx: Context) : View(ctx) {
 
     override fun onDraw(c: Canvas) {
         if (board.width() < 8f || board.height() < 8f) return
-        // пунктирная рамка выбранной доски — видна, пока открыто меню
         if (showFrame) c.drawRect(board, frame)
         val m = move ?: return
         val x1 = cx(m.from)
@@ -75,19 +93,17 @@ class ArrowView(ctx: Context) : View(ctx) {
 }
 
 /**
- * Полноэкранное затемнение: палец проводит прямоугольник от левого верхнего
- * к правому нижнему углу доски. При отпускании пальца область сохраняется автоматически.
- * Кнопка «Отмена» внизу закрывает выбор без сохранения.
+ * Полноэкранное затемнение. Нужно провести пальцем ТОЛЬКО сверху вниз:
+ * от верхней до нижней границы доски. Ширина подгоняется под экран автоматически.
+ * Область сохраняется при отпускании пальца. «Отмена» — внизу.
  */
 class BoardSelectView(
     ctx: Context,
     private val onDone: (RectF) -> Unit,
     private val onCancel: () -> Unit
 ) : View(ctx) {
-    private var sx = 0f
-    private var sy = 0f
-    private var ex = 0f
-    private var ey = 0f
+    private var y1 = 0f
+    private var y2 = 0f
     private var drawing = false
 
     private val frame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -96,6 +112,10 @@ class BoardSelectView(
         strokeWidth = 4f
     }
     private val inner = Paint().apply { color = Color.argb(50, 0, 200, 83) }
+    private val bandLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(255, 255, 193, 7)
+        strokeWidth = 5f
+    }
     private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textSize = 42f
@@ -109,15 +129,17 @@ class BoardSelectView(
     }
 
     override fun onDraw(c: Canvas) {
-        c.drawText("Проведите от левого верхнего", width / 2f, 140f, txt)
-        c.drawText("до правого нижнего угла доски", width / 2f, 200f, txt)
+        c.drawText("Проведи пальцем сверху вниз:", width / 2f, 140f, txt)
+        c.drawText("от верхнего до нижнего края доски", width / 2f, 200f, txt)
         cancelRect.set(width / 2f - 160f, height - 220f, width / 2f + 160f, height - 120f)
         c.drawRoundRect(cancelRect, 30f, 30f, cancelBg)
         c.drawText("Отмена", width / 2f, height - 155f, txt)
         if (drawing) {
-            val r = RectF(minOf(sx, ex), minOf(sy, ey), maxOf(sx, ex), maxOf(sy, ey))
+            val r = boardFromBand(y1, y2, width.toFloat())
             c.drawRect(r, inner)
             c.drawRect(r, frame)
+            c.drawLine(0f, y1, width.toFloat(), y1, bandLine)
+            c.drawLine(0f, y2, width.toFloat(), y2, bandLine)
         }
     }
 
@@ -128,19 +150,19 @@ class BoardSelectView(
                     onCancel()
                     return true
                 }
-                sx = e.x; sy = e.y; ex = e.x; ey = e.y
+                y1 = e.y
+                y2 = e.y
                 drawing = true
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
-                ex = e.x; ey = e.y
+                y2 = e.y
                 invalidate()
             }
             MotionEvent.ACTION_UP -> {
                 if (drawing.not()) return true
-                ex = e.x; ey = e.y
-                val r = RectF(minOf(sx, ex), minOf(sy, ey), maxOf(sx, ex), maxOf(sy, ey))
-                if (r.width() > 100f && r.height() > 100f) onDone(r)
+                y2 = e.y
+                if (abs(y2 - y1) > 150f) onDone(boardFromBand(y1, y2, width.toFloat()))
                 else {
                     drawing = false
                     invalidate()

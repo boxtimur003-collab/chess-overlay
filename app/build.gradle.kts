@@ -19,3 +19,7 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
+
+dependencies {
+    implementation("org.opencv:opencv:4.9.0")
+}
