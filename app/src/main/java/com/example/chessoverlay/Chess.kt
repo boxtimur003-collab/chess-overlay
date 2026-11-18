@@ -1,6 +1,7 @@
 package com.example.chessoverlay
 
 import kotlin.math.abs
+import kotlin.math.max
 
 data class Move(val from: Int, val to: Int, val promo: Char = ' ') {
     override fun toString(): String {
@@ -243,6 +244,16 @@ class Position(
 }
 
 object Engine {
+    private class TimeUp : RuntimeException()
+
+    private var deadline = 0L
+    private var nodes = 0
+
+    private fun tick() {
+        nodes++
+        if ((nodes and 1023) == 0 && System.currentTimeMillis() > deadline) throw TimeUp()
+    }
+
     private fun value(c: Char): Int = when (c.lowercaseChar()) {
         'p' -> 100; 'n' -> 320; 'b' -> 330; 'r' -> 500; 'q' -> 900; else -> 0
     }
@@ -272,8 +283,26 @@ object Engine {
             (if (t != '.') value(t) * 10 - value(p.b[m.from]) else 0) + (if (m.promo == 'q') 800 else 0)
         }
 
+    private fun qsearch(p: Position, alpha0: Int, beta: Int, qd: Int): Int {
+        tick()
+        val stand = eval(p)
+        if (qd <= 0) return stand
+        if (stand >= beta) return beta
+        var alpha = max(alpha0, stand)
+        val caps = p.pseudo(p.white).filter { p.b[it.to] != '.' || it.promo == 'q' }
+        for (m in order(p, caps)) {
+            val n = p.make(m)
+            if (n.inCheck(p.white)) continue
+            val s = -qsearch(n, -beta, -alpha, qd - 1)
+            if (s >= beta) return beta
+            if (s > alpha) alpha = s
+        }
+        return alpha
+    }
+
     private fun search(p: Position, d: Int, alpha0: Int, beta: Int, ply: Int): Int {
-        if (d <= 0) return eval(p)
+        tick()
+        if (d <= 0) return qsearch(p, alpha0, beta, 3)
         val ms = p.legal()
         if (ms.isEmpty()) return if (p.inCheck(p.white)) -100000 + ply else 0
         var alpha = alpha0
@@ -285,18 +314,33 @@ object Engine {
         return alpha
     }
 
-    fun best(pos: Position, depth: Int): Move? {
-        val ms = order(pos, pos.legal())
+    /** Итеративное углубление до depth; при нехватке времени возвращает лучший ход предыдущей глубины. */
+    fun best(pos: Position, depth: Int, timeMs: Long = 8000L): Move? {
+        deadline = System.currentTimeMillis() + timeMs
+        nodes = 0
+        var ms = order(pos, pos.legal())
         if (ms.isEmpty()) return null
-        var bestM: Move? = null
-        var alpha = -1000000
-        for (m in ms) {
-            val s = -search(pos.make(m), depth - 1, -1000000, -alpha, 1)
-            if (bestM == null || s > alpha) {
-                alpha = s
-                bestM = m
+        var best: Move = ms[0]
+        for (d in 1..depth) {
+            try {
+                var alpha = -1000000
+                var cur: Move? = null
+                for (m in ms) {
+                    val s = -search(pos.make(m), d - 1, -1000000, -alpha, 1)
+                    if (cur == null || s > alpha) {
+                        alpha = s
+                        cur = m
+                    }
+                }
+                if (cur != null) {
+                    best = cur
+                    val c = cur
+                    ms = listOf(c) + ms.filter { it != c }
+                }
+            } catch (e: TimeUp) {
+                break
             }
         }
-        return bestM
+        return best
     }
 }
