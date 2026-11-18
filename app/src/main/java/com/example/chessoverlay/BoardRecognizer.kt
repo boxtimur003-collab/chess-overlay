@@ -2,6 +2,7 @@ package com.example.chessoverlay
 
 import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.os.SystemClock
 import android.util.Base64
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
@@ -13,20 +14,25 @@ import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import kotlin.math.abs
 
-class Rec(val fen: String?, val msg: String)
+/** turn: 1 = наш ход, 0 = ход соперника, -1 = не определили по подсветке последнего хода */
+class Rec(val fen: String?, val msg: String, val turn: Int = -1)
 
 object BoardRecognizer {
+    const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
     private const val S = 64          // размер клетки после нормализации, px
     private const val N = 32          // размер маски-силуэта для сравнения
     private const val MIN_SCORE = 0.38f
-    private const val VER = 7         // версия формата эталонов (старые игнорируются)
+    private const val VER = 7         // версия формата эталонов (эталоны из v7 остаются валидными)
 
     private var cvReady = false
     private val tpl = HashMap<Char, FloatArray>()
     private var thr = -1f
+    private var lastLearnAt = 0L
 
-    private class Cell(val occupied: Boolean, val mask: FloatArray?, val bright: Float)
+    private class Cell(val occupied: Boolean, val mask: FloatArray?, val bright: Float, val bg: IntArray)
+    private class LearnRes(val ok: Boolean, val msg: String)
 
     private fun ensureCv(): Boolean {
         if (cvReady.not()) {
@@ -58,6 +64,28 @@ object BoardRecognizer {
 
     fun hasTemplates() = tpl.size == 6 && thr >= 0f
 
+    /** Расстановка фигур (первое поле FEN) из массива 8x8, индекс = (8 - ранг) * 8 + файл. */
+    fun placement(b: CharArray): String {
+        val sb = StringBuilder()
+        for (rr in 0..7) {
+            var empty = 0
+            for (ff in 0..7) {
+                val ch = b[rr * 8 + ff]
+                if (ch == '.') empty++
+                else {
+                    if (empty > 0) {
+                        sb.append(empty)
+                        empty = 0
+                    }
+                    sb.append(ch)
+                }
+            }
+            if (empty > 0) sb.append(empty)
+            if (rr < 7) sb.append('/')
+        }
+        return sb.toString()
+    }
+
     // ---------- анализ клетки ----------
 
     private fun med(a: ArrayList<Int>): Int {
@@ -82,16 +110,14 @@ object BoardRecognizer {
     }
 
     /**
-     * Клетка -> (занята?, силуэт 32x32, яркость внутри силуэта).
-     * Маска = цветовое отличие от фона клетки  ИЛИ  морфологический градиент яркости.
-     * Оба порога адаптивные: считаются по шуму рамки именно этой клетки, поэтому
-     * тёмная фигура на тёмной клетке (низкий контраст) всё равно находится.
+     * Клетка -> (занята?, силуэт 32x32, яркость внутри силуэта, цвет фона клетки).
+     * Маска = цветовое отличие от фона ИЛИ морфологический градиент яркости, пороги адаптивные
+     * (считаются по шуму рамки клетки), поэтому тёмные темы тоже работают.
      */
     private fun analyze(cell: Mat): Cell {
         val gray = Mat()
         Imgproc.cvtColor(cell, gray, Imgproc.COLOR_BGR2GRAY)
 
-        // 1) фон клетки: медиана цвета рамки (учитывает подсветку хода/выделения)
         val buf = ByteArray(S * S * 3)
         cell.get(0, 0, buf)
         val bs = ArrayList<Int>()
@@ -103,7 +129,11 @@ object BoardRecognizer {
             gs.add(buf[i + 1].toInt() and 0xFF)
             rs.add(buf[i + 2].toInt() and 0xFF)
         }
-        val bg = Scalar(med(bs).toDouble(), med(gs).toDouble(), med(rs).toDouble())
+        val medB = med(bs)
+        val medG = med(gs)
+        val medR = med(rs)
+        val bgI = intArrayOf(medB, medG, medR)
+        val bg = Scalar(medB.toDouble(), medG.toDouble(), medR.toDouble())
         val bgMat = Mat(S, S, CvType.CV_8UC3, bg)
         val diff = Mat()
         Core.absdiff(cell, bgMat, diff)
@@ -113,7 +143,6 @@ object BoardRecognizer {
         Core.max(ch[0], ch[1], dmax)
         Core.max(dmax, ch[2], dmax)
 
-        // 2) градиент яркости (перепады) — ловит контур даже при почти одинаковом цвете
         val blur = Mat()
         Imgproc.GaussianBlur(gray, blur, Size(3.0, 3.0), 0.0)
         val k3 = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
@@ -121,7 +150,6 @@ object BoardRecognizer {
         val grad = Mat()
         Imgproc.morphologyEx(blur, grad, Imgproc.MORPH_GRADIENT, k3)
 
-        // 3) адаптивные пороги по шуму фона этой клетки
         val db = ByteArray(S * S)
         val gb = ByteArray(S * S)
         dmax.get(0, 0, db)
@@ -142,12 +170,10 @@ object BoardRecognizer {
         val mask = Mat()
         Core.bitwise_or(md, mg, mask)
 
-        // края клетки не смотрим (линии сетки, соседние клетки)
         val roi = Mat.zeros(S, S, CvType.CV_8UC1)
         roi.submat(Rect(4, 4, S - 8, S - 8)).setTo(Scalar(255.0))
         Core.bitwise_and(mask, roi, mask)
 
-        // 4) замыкаем контур, ищем внешние контуры
         Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, k5)
         val contours = ArrayList<MatOfPoint>()
         Imgproc.findContours(mask.clone(), contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
@@ -160,12 +186,10 @@ object BoardRecognizer {
                 big = c
             }
         }
-        val bigC = big ?: return Cell(false, null, 0f)
+        val bigC = big ?: return Cell(false, null, 0f, bgI)
         val br = Imgproc.boundingRect(bigC)
-        // занята, если силуэт достаточно большой и высокий (отсекает подсказки-точки и буквы координат)
-        if (maxA < 0.08 * S * S || br.height < 0.38 * S) return Cell(false, null, 0f)
+        if (maxA < 0.08 * S * S || br.height < 0.38 * S) return Cell(false, null, 0f, bgI)
 
-        // 5) заливаем силуэт; мелкие отдельные пятна (буквы координат) не берём
         val keep = ArrayList<MatOfPoint>()
         for (c in contours) {
             val a = Imgproc.contourArea(c)
@@ -174,7 +198,6 @@ object BoardRecognizer {
         val filled = Mat.zeros(S, S, CvType.CV_8UC1)
         Imgproc.drawContours(filled, keep, -1, Scalar(255.0), -1)
 
-        // 6) яркость внутри силуэта (без контура) — отличает белые фигуры от чёрных
         val inner = Mat()
         Imgproc.erode(filled, inner, k5)
         Imgproc.erode(inner, inner, k5)
@@ -186,7 +209,7 @@ object BoardRecognizer {
         val sb = ByteArray(N * N)
         small.get(0, 0, sb)
         val m = FloatArray(N * N) { (sb[it].toInt() and 0xFF) / 255f }
-        return Cell(true, m, bright.toFloat())
+        return Cell(true, m, bright.toFloat(), bgI)
     }
 
     private fun softIou(a: FloatArray, b: FloatArray): Float {
@@ -216,19 +239,10 @@ object BoardRecognizer {
         }
     }
 
-    // ---------- «Запомнить эталоны» ----------
+    // ---------- автообучение эталонов по начальной позиции ----------
 
-    /** Берёт НАЧАЛЬНУЮ позицию на экране и запоминает силуэты фигур + порог яркости белых/чёрных. */
-    fun learn(bmp: Bitmap, playWhite: Boolean, prefs: SharedPreferences): Rec {
-        if (ensureCv().not()) return Rec(null, "OpenCV не загрузился (initLocal вернул false)")
-        val flip = playWhite.not()
-        val cells = try {
-            scanCells(bmp)
-        } catch (e: Throwable) {
-            return Rec(null, "Ошибка OpenCV: ${e.message}")
-        }
-        val startB = Position.fromFen(Position.START)?.b ?: return Rec(null, "Внутренняя ошибка START")
-
+    private fun startMismatch(cells: Array<Array<Cell>>, flip: Boolean): Pair<ArrayList<String>, ArrayList<String>> {
+        val startB = Position.fromFen(Position.START)?.b ?: CharArray(64) { '.' }
         val missing = ArrayList<String>()
         val extra = ArrayList<String>()
         for (r in 0..7) {
@@ -241,14 +255,15 @@ object BoardRecognizer {
                 if (exp == '.' && occ) extra.add(sqName(rr, ff))
             }
         }
-        if (missing.size + extra.size > 4) {
-            var m = "Это не похоже на начальную позицию."
-            if (missing.isNotEmpty()) m += " Фигур нет на: " + missing.joinToString(",") + "."
-            if (extra.isNotEmpty()) m += " Лишнее на: " + extra.joinToString(",") + "."
-            m += " Проверь рамку («Доска») и переключатель «Играю за»."
-            return Rec(null, m)
-        }
+        return Pair(missing, extra)
+    }
 
+    private fun learnFromCells(cells: Array<Array<Cell>>, flip: Boolean, prefs: SharedPreferences): LearnRes {
+        val startB = Position.fromFen(Position.START)?.b ?: return LearnRes(false, "Внутренняя ошибка START")
+        val mm = startMismatch(cells, flip)
+        if (mm.first.size + mm.second.size > 4) {
+            return LearnRes(false, "Не похоже на начальную позицию. Проверь рамку («Доска») и переключатель «Играю за».")
+        }
         val sums = HashMap<Char, FloatArray>()
         val cnt = HashMap<Char, Int>()
         var sw = 0f
@@ -278,14 +293,14 @@ object BoardRecognizer {
         }
         if (sums.size < 6) {
             val lack = "pnbrqk".filter { sums.containsKey(it).not() }
-            return Rec(null, "Не хватило фигур для эталонов (нет типов: $lack). Нет фигур на: " + missing.joinToString(","))
+            return LearnRes(false, "Не хватило фигур для эталонов (нет типов: $lack). Нет фигур на: " + mm.first.joinToString(","))
         }
-        if (nw == 0 || nb == 0) return Rec(null, "Не вижу и белых, и чёрных фигур — проверь рамку доски.")
+        if (nw == 0 || nb == 0) return LearnRes(false, "Не вижу и белых, и чёрных фигур — проверь рамку доски.")
         val aw = sw / nw
         val ab = sbk / nb
         if (aw <= ab + 8f) {
-            return Rec(
-                null,
+            return LearnRes(
+                false,
                 "Белые и чёрные фигуры не различились по яркости (белые ${aw.toInt()}, чёрные ${ab.toInt()}). " +
                         "Проверь, что «Играю за» совпадает с тем, кто стоит внизу доски."
             )
@@ -301,16 +316,23 @@ object BoardRecognizer {
         }
         thr = newThr
         ed.putFloat("bright_thr", newThr).putInt("tpl_ver", VER).commit()
-        var msg = "Эталоны сохранены ($samples фигур, порог яркости ${newThr.toInt()})."
-        if (missing.isNotEmpty()) msg += " Не нашёл: " + missing.joinToString(",") + "."
-        return Rec("", msg)
+        return LearnRes(true, "Эталоны сохранены автоматически ($samples фигур).")
     }
 
-    // ---------- «Сканировать» ----------
+    // ---------- распознавание ----------
 
-    /** Скриншот доски -> FEN по сохранённым эталонам. Ничего не учит и не пишет на диск. */
-    fun recognize(bmp: Bitmap, playWhite: Boolean): Rec {
-        if (hasTemplates().not()) return Rec(null, "Сначала нажми \"Запомнить эталоны\"")
+    private fun medCh(l: ArrayList<IntArray>, ch: Int): Int {
+        val a = ArrayList<Int>()
+        for (x in l) a.add(x[ch])
+        return med(a)
+    }
+
+    /**
+     * Скриншот доски -> FEN. Если на доске начальная позиция — эталоны фигур сохраняются сами
+     * (первый раз, и потом обновляются при каждой новой партии, не чаще раза в 2 минуты).
+     * На диск ничего не пишется, кроме самих эталонов в SharedPreferences.
+     */
+    fun recognize(bmp: Bitmap, playWhite: Boolean, prefs: SharedPreferences): Rec {
         if (ensureCv().not()) return Rec(null, "OpenCV не загрузился (initLocal вернул false)")
         val flip = playWhite.not()
         val cells = try {
@@ -322,7 +344,25 @@ object BoardRecognizer {
         for (r in 0..7) for (c in 0..7) if (cells[r][c].occupied) occ++
         if (occ == 0) return Rec(null, "Фигур не найдено: проверь рамку доски («Доска»).")
 
-        val grid = CharArray(64) { '.' } // реальная ориентация: индекс = (8 - ранг) * 8 + файл
+        var note = ""
+        val mm = startMismatch(cells, flip)
+        val nearStart = mm.first.size + mm.second.size <= 4
+        val strictStart = mm.first.isEmpty() && mm.second.isEmpty()
+        val now = SystemClock.elapsedRealtime()
+        if ((hasTemplates().not() && nearStart) || (strictStart && now - lastLearnAt > 120000L)) {
+            val lr = learnFromCells(cells, flip, prefs)
+            if (lr.ok) {
+                note = lr.msg + " "
+                lastLearnAt = now
+            } else if (hasTemplates().not()) {
+                return Rec(null, lr.msg)
+            }
+        }
+        if (hasTemplates().not()) {
+            return Rec(null, "Эталонов ещё нет: нажми «Сканировать» в начальной позиции — они сохранятся сами.")
+        }
+
+        val grid = CharArray(64) { '.' }
         val bad = ArrayList<String>()
         var count = 0
         var wk = 0
@@ -358,34 +398,42 @@ object BoardRecognizer {
                 count++
             }
         }
-        if (bad.isNotEmpty()) return Rec(null, "Не распознаны клетки: " + bad.joinToString(", "))
-        if (wk != 1) return Rec(null, if (wk == 0) "Не найден белый король." else "Найдено белых королей: $wk.")
-        if (bk != 1) return Rec(null, if (bk == 0) "Не найден чёрный король." else "Найдено чёрных королей: $bk.")
+        if (bad.isNotEmpty()) return Rec(null, note + "Не распознаны клетки: " + bad.joinToString(", "))
+        if (wk != 1) return Rec(null, note + (if (wk == 0) "Не найден белый король." else "Найдено белых королей: $wk."))
+        if (bk != 1) return Rec(null, note + (if (bk == 0) "Не найден чёрный король." else "Найдено чёрных королей: $bk."))
 
-        val sb = StringBuilder()
-        for (rr in 0..7) {
-            var empty = 0
-            for (ff in 0..7) {
-                val ch = grid[rr * 8 + ff]
-                if (ch == '.') empty++
-                else {
-                    if (empty > 0) {
-                        sb.append(empty)
-                        empty = 0
-                    }
-                    sb.append(ch)
+        // кто ходил последним: подсвеченная клетка (последний ход) с фигурой
+        val par0 = ArrayList<IntArray>()
+        val par1 = ArrayList<IntArray>()
+        for (r in 0..7) for (c in 0..7) {
+            if ((r + c) % 2 == 0) par0.add(cells[r][c].bg) else par1.add(cells[r][c].bg)
+        }
+        val m0 = intArrayOf(medCh(par0, 0), medCh(par0, 1), medCh(par0, 2))
+        val m1 = intArrayOf(medCh(par1, 0), medCh(par1, 1), medCh(par1, 2))
+        var ourHi = 0
+        var oppHi = 0
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val cell = cells[r][c]
+                if (cell.mask == null) continue
+                val ref = if ((r + c) % 2 == 0) m0 else m1
+                var d = 0
+                for (k in 0..2) d = maxOf(d, abs(cell.bg[k] - ref[k]))
+                if (d > 16) {
+                    val whitePiece = cell.bright > thr
+                    if (whitePiece == playWhite) ourHi++ else oppHi++
                 }
             }
-            if (empty > 0) sb.append(empty)
-            if (rr < 7) sb.append('/')
         }
+        val turn = if (oppHi > 0 && ourHi == 0) 1 else if (ourHi > 0 && oppHi == 0) 0 else -1
+
         var cs = ""
         if (grid[60] == 'K' && grid[63] == 'R') cs += "K"
         if (grid[60] == 'K' && grid[56] == 'R') cs += "Q"
         if (grid[4] == 'k' && grid[7] == 'r') cs += "k"
         if (grid[4] == 'k' && grid[0] == 'r') cs += "q"
         if (cs.isEmpty()) cs = "-"
-        val fen = sb.toString() + (if (playWhite) " w " else " b ") + cs + " - 0 1"
-        return Rec(fen, "Фигур: $count.")
+        val fen = placement(grid) + (if (playWhite) " w " else " b ") + cs + " - 0 1"
+        return Rec(fen, note + "Фигур: $count.", turn)
     }
 }

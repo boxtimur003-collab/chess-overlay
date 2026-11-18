@@ -24,6 +24,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
@@ -43,6 +44,8 @@ class OverlayService : Service() {
     private lateinit var bubbleLp: WindowManager.LayoutParams
     private lateinit var menuLp: WindowManager.LayoutParams
     private lateinit var status: TextView
+    private lateinit var btnAutoCap: Button
+    private lateinit var btnAutoPlay: Button
     private var menuShown = false
     private var selectView: BoardSelectView? = null
     private var level = 1 // 0 = Легкий, 1 = Средний, 2 = Сложный
@@ -57,6 +60,21 @@ class OverlayService : Service() {
     private var lastImg: Image? = null
     private var lastFrameAt = 0L
     private var busy = false
+
+    // автоматика
+    private var autoCapture = false
+    private var autoPlay = false
+    private var lastPlacement: String? = null
+    private var afterOurMove: String? = null
+    private var playedFrom: String? = null
+    private var lastMoveAt = 0L
+    private var retries = 0
+    private val tick = object : Runnable {
+        override fun run() {
+            autoTick()
+            if (autoCapture || autoPlay) handler.postDelayed(this, 4000L)
+        }
+    }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -75,7 +93,7 @@ class OverlayService : Service() {
 
     override fun onBind(i: Intent?): IBinder? = null
 
-    /** Удаляем last_board.png, если он остался от прошлых версий. Новые версии скриншоты на диск не пишут. */
+    /** Удаляем last_board.png, если он остался от старых версий. Скриншоты на диск не пишутся. */
     private fun cleanupOldScreens() {
         try {
             File(getExternalFilesDir(null) ?: filesDir, "last_board.png").delete()
@@ -120,7 +138,7 @@ class OverlayService : Service() {
         playWhite = prefs.getBoolean("playWhite", true)
         level = prefs.getInt("level", 1).coerceIn(0, 2)
         cleanupOldScreens()
-        BoardRecognizer.loadTemplates(prefs) // эталоны фигур остаются после перезапуска
+        BoardRecognizer.loadTemplates(prefs) // эталоны остаются после перезапуска
         buildArrow()
         buildBubble()
         buildMenu()
@@ -239,6 +257,16 @@ class OverlayService : Service() {
         setOnClickListener { click() }
     }
 
+    private fun styleToggle(b: Button, label: String, on: Boolean) {
+        b.text = label + ": " + (if (on) "вкл" else "выкл")
+        b.background = roundBg(Color.parseColor(if (on) "#FF2E7D32" else "#FF3A3A3A"), 10)
+    }
+
+    private fun updateToggles() {
+        styleToggle(btnAutoCap, "Автозахват", autoCapture)
+        styleToggle(btnAutoPlay, "Автоход", autoPlay)
+    }
+
     /** Сегментированный переключатель. */
     private fun segmented(labels: List<String>, selected: Int, onSel: (Int) -> Unit): LinearLayout {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -270,7 +298,6 @@ class OverlayService : Service() {
     }
 
     private fun buildMenu() {
-        // Горизонтальная широкая плашка: слева ручка (тянуть вверх/вниз), справа — все элементы
         menu = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = roundBg(Color.parseColor("#EE1E1E1E"), 16)
@@ -299,6 +326,9 @@ class OverlayService : Service() {
             arrow.flip = playWhite.not()
             arrow.move = null
             arrow.invalidate()
+            lastPlacement = null
+            afterOurMove = null
+            playedFrom = null
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f))
         row1.addView(segmented(listOf("Легкий", "Средний", "Сложный"), level) { i ->
             level = i
@@ -312,16 +342,19 @@ class OverlayService : Service() {
             return lp
         }
 
-        // строка 2: настройка
+        // строка 2: автоматика
         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row2.addView(btn("Запомнить эталоны") { learnTemplates() }, lpB(1.8f))
-        row2.addView(btn("Доска") { startBoardSelect() }, lpB(1f))
-        row2.addView(btn("Закрыть") { stopSelf() }, lpB(1f))
+        btnAutoCap = btn("Автозахват: выкл") { toggleAutoCapture() }
+        btnAutoPlay = btn("Автоход: выкл") { toggleAutoPlay() }
+        row2.addView(btnAutoCap, lpB(1f))
+        row2.addView(btnAutoPlay, lpB(1f))
         content.addView(row2)
 
-        // строка 3: главная кнопка
+        // строка 3: основные кнопки
         val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row3.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1f))
+        row3.addView(btn("Доска") { startBoardSelect() }, lpB(1f))
+        row3.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1.4f))
+        row3.addView(btn("Закрыть") { stopSelf() }, lpB(1f))
         content.addView(row3)
 
         status = TextView(this).apply {
@@ -331,13 +364,14 @@ class OverlayService : Service() {
             setPadding(dp(2), dp(2), dp(2), 0)
         }
         content.addView(status)
+        updateToggles()
 
         val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         val sz = realSize()
         menuLp = params(sz[0] - dp(16), WindowManager.LayoutParams.WRAP_CONTENT, f)
         menuLp.x = dp(8)
-        menuLp.y = sz[1] - dp(250)
+        menuLp.y = sz[1] - dp(270)
         wm.addView(menu, menuLp)
         makeVDraggable(handle, menuLp, menu)
     }
@@ -357,6 +391,18 @@ class OverlayService : Service() {
         menu.visibility = if (v) (if (menuShown) View.VISIBLE else View.GONE) else View.INVISIBLE
     }
 
+    /** На время жеста наши окна не должны перехватывать нажатия по доске. */
+    private fun setTouchable(on: Boolean) {
+        val f = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        menuLp.flags = if (on) menuLp.flags and f.inv() else menuLp.flags or f
+        bubbleLp.flags = if (on) bubbleLp.flags and f.inv() else bubbleLp.flags or f
+        try {
+            wm.updateViewLayout(menu, menuLp)
+            wm.updateViewLayout(bubble, bubbleLp)
+        } catch (e: Exception) {
+        }
+    }
+
     // ---------- выбор доски: один вертикальный свайп ----------
 
     private fun startBoardSelect() {
@@ -367,6 +413,7 @@ class OverlayService : Service() {
                 .putFloat("br", r.right).putFloat("bb", r.bottom).commit()
             finishSelect()
             loadBoard()
+            lastPlacement = null
             status.text = "Доска сохранена ✓ (${r.width().toInt()}x${r.height().toInt()})"
         }, {
             finishSelect()
@@ -405,7 +452,7 @@ class OverlayService : Service() {
             }, handler)
             val sz = realSize()
             val ir = ImageReader.newInstance(sz[0], sz[1], PixelFormat.RGBA_8888, 3)
-            // держим самый свежий кадр и время его прихода — так снимок точно сделан после скрытия UI
+            // держим самый свежий кадр и время его прихода
             ir.setOnImageAvailableListener({ r ->
                 try {
                     val img = r.acquireLatestImage()
@@ -423,7 +470,7 @@ class OverlayService : Service() {
             )
             projection = mp
             reader = ir
-            status.text = "Захват экрана включён. Открой Chess.com и нажми нужную кнопку"
+            status.text = "Захват экрана включён. Открой Chess.com и нажми «Сканировать» в начальной позиции"
         } catch (e: Exception) {
             status.text = "Ошибка захвата: ${e.message}"
         }
@@ -457,23 +504,48 @@ class OverlayService : Service() {
         }
     }
 
-    /** Прячет UI на 500 мс, берёт свежий кадр и вырезает область доски. Всё в памяти, на диск ничего не пишется. */
-    private fun captureBoard(done: (Bitmap?, String) -> Unit) {
+    private fun viewRect(x: Int, y: Int, w: Int, h: Int) = RectF(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat())
+
+    /**
+     * fullHide=true  — прячем всё (ручное «Сканировать»).
+     * fullHide=false — прячем только то, что реально попадает в кадр доски (стрелка/рамка, и меню/кнопку, если
+     *                  они перекрывают доску): так в автоматическом режиме экран почти не мигает.
+     * Кадр берётся из памяти, на диск ничего не пишется.
+     */
+    private fun captureBoard(fullHide: Boolean, done: (Bitmap?, String) -> Unit) {
         if (reader == null) {
             done(null, "Захват экрана не включён.")
             return
         }
         val b = RectF(arrow.board)
         val hideAt = SystemClock.uptimeMillis()
-        setUiVisible(false)
-        handler.postDelayed({ grab(b, hideAt, 0, done) }, 500)
+        var hid = false
+        if (fullHide) {
+            setUiVisible(false)
+            hid = true
+        } else {
+            if (arrow.move != null || arrow.showFrame) {
+                arrow.visibility = View.INVISIBLE
+                hid = true
+            }
+            if (RectF.intersects(b, viewRect(bubbleLp.x, bubbleLp.y, bubbleLp.width, bubbleLp.height))) {
+                bubble.visibility = View.INVISIBLE
+                hid = true
+            }
+            if (menuShown && RectF.intersects(b, viewRect(menuLp.x, menuLp.y, menu.width, menu.height))) {
+                menu.visibility = View.INVISIBLE
+                hid = true
+            }
+        }
+        val needFresh = hid
+        handler.postDelayed({ grab(b, hideAt, 0, needFresh, done) }, if (hid) 500L else 0L)
     }
 
-    private fun grab(b: RectF, hideAt: Long, attempt: Int, done: (Bitmap?, String) -> Unit) {
+    private fun grab(b: RectF, hideAt: Long, attempt: Int, needFresh: Boolean, done: (Bitmap?, String) -> Unit) {
         val cur = lastImg
-        val fresh = cur != null && lastFrameAt >= hideAt + 80
+        val fresh = cur != null && (needFresh.not() || lastFrameAt >= hideAt + 80)
         if (fresh.not() && attempt < 10) {
-            handler.postDelayed({ grab(b, hideAt, attempt + 1, done) }, 150)
+            handler.postDelayed({ grab(b, hideAt, attempt + 1, needFresh, done) }, 150L)
             return
         }
         if (cur == null) {
@@ -481,13 +553,14 @@ class OverlayService : Service() {
             done(null, "Нет кадра экрана.")
             return
         }
-        lastImg = null
         var bmp: Bitmap? = null
         try {
             val plane = cur.planes[0]
             val bw = plane.rowStride / plane.pixelStride
             val full = Bitmap.createBitmap(bw, cur.height, Bitmap.Config.ARGB_8888)
-            full.copyPixelsFromBuffer(plane.buffer)
+            val buf = plane.buffer
+            buf.rewind()
+            full.copyPixelsFromBuffer(buf)
             val l = b.left.toInt().coerceIn(0, cur.width - 2)
             val t = b.top.toInt().coerceIn(0, cur.height - 2)
             val w = b.width().toInt().coerceAtMost(cur.width - l).coerceAtLeast(1)
@@ -496,121 +569,264 @@ class OverlayService : Service() {
             full.recycle()
         } catch (e: Exception) {
             bmp = null
-        } finally {
-            cur.close() // кадр освобождён сразу
         }
-        setUiVisible(true) // всё возвращается на место
+        // сам кадр не закрываем: он остаётся «последним» и закроется, когда придёт новый (только RAM)
+        setUiVisible(true)
         val out = bmp
         if (out == null) done(null, "Ошибка скриншота.") else done(out, "")
     }
 
-    // ---------- общие проверки перед снимком ----------
+    // ---------- переключатели ----------
 
-    private fun prepare(): Boolean {
-        if (busy) return false
-        if (hasBoard().not()) {
-            status.text = "Сначала нажми «Доска» и проведи пальцем сверху вниз."
-            return false
-        }
-        if (reader == null) {
-            requestCapture()
-            status.text = "Разреши захват экрана и снова нажми кнопку."
-            return false
-        }
-        return true
+    private fun restartTick() {
+        handler.removeCallbacks(tick)
+        if (autoCapture || autoPlay) handler.postDelayed(tick, 800L)
     }
 
-    // ---------- «Запомнить эталоны» ----------
+    private fun toggleAutoCapture() {
+        autoCapture = autoCapture.not()
+        if (autoCapture) {
+            lastPlacement = null
+            if (reader == null) {
+                requestCapture()
+                status.text = "Разреши захват экрана — автозахват начнётся сам."
+            } else status.text = "Автозахват включён (каждые ~4 с)."
+        } else {
+            status.text = "Автозахват выключен."
+        }
+        restartTick()
+        updateToggles()
+    }
 
-    private fun learnTemplates() {
-        if (prepare().not()) return
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun toggleAutoPlay() {
+        if (autoPlay.not()) {
+            if (AutoPlayer.instance == null) {
+                status.text = "Включи службу «Chess AutoPlayer» (Настройки → Специальные возможности), потом снова нажми «Автоход»."
+                openAccessibilitySettings()
+                return
+            }
+            autoPlay = true
+            lastPlacement = null
+            afterOurMove = null
+            playedFrom = null
+            retries = 0
+            arrow.move = null
+            arrow.invalidate()
+            if (reader == null) {
+                requestCapture()
+                status.text = "Автоход включён. Разреши захват экрана."
+            } else status.text = "Автоход включён: ход только когда очередь нашей стороны."
+        } else {
+            autoPlay = false
+            status.text = "Автоход выключен."
+        }
+        restartTick()
+        updateToggles()
+    }
+
+    // ---------- цикл: скриншот -> распознавание -> ход ----------
+
+    private fun autoTick() {
+        if (busy || selectView != null) return
+        if (SystemClock.uptimeMillis() - lastMoveAt < 3000L) return
+        if (hasBoard().not() || reader == null) return
+        cycle(true)
+    }
+
+    private fun scan() {
+        if (busy) return
+        cycle(false)
+    }
+
+    private fun cycle(auto: Boolean) {
+        if (busy) return
+        if (hasBoard().not()) {
+            status.text = "Сначала нажми «Доска» и проведи пальцем сверху вниз."
+            return
+        }
+        if (reader == null) {
+            if (auto.not()) {
+                requestCapture()
+                status.text = "Разреши захват экрана и снова нажми «Сканировать»."
+            }
+            return
+        }
         busy = true
-        arrow.move = null
-        arrow.invalidate()
-        status.text = "Скриншот..."
-        captureBoard { bmp, msg ->
+        if (auto.not()) {
+            arrow.move = null
+            arrow.invalidate()
+            status.text = "Скриншот..."
+        }
+        captureBoard(auto.not()) { bmp, msg ->
             if (bmp == null) {
                 busy = false
                 status.text = msg
             } else {
-                status.text = "Запоминаю эталоны..."
                 val white = playWhite
                 Thread {
-                    val rec = BoardRecognizer.learn(bmp, white, prefs)
-                    bmp.recycle() // скриншот удалён из памяти
+                    val rec = BoardRecognizer.recognize(bmp, white, prefs)
+                    bmp.recycle() // распознали — скриншот сразу удаляем из памяти
+                    handler.post { onRecognized(rec, auto, white) }
+                }.start()
+            }
+        }
+    }
+
+    private fun fmt(mv: Move): String {
+        val s = mv.toString()
+        return s.substring(0, 2) + "-" + s.substring(2, 4) + (if (mv.promo != ' ') "=" + mv.promo.uppercaseChar() else "")
+    }
+
+    private fun onRecognized(rec: Rec, auto: Boolean, white: Boolean) {
+        val fen = rec.fen
+        val pos = if (fen != null) Position.fromFen(fen) else null
+        if (fen == null || pos == null) {
+            status.text = (if (auto) "Авто: " else "") + (if (fen == null) rec.msg else "Некорректный FEN: $fen")
+            busy = false
+            return
+        }
+        val placement = fen.substringBefore(' ')
+        if (auto) {
+            // мы уже сходили, соперник ещё нет
+            if (placement == afterOurMove) {
+                lastPlacement = placement
+                status.text = "Авто: жду ход соперника"
+                busy = false
+                return
+            }
+            // ход не прошёл (позиция та же, что до нашего хода) — разрешаем повтор
+            val retry = autoPlay && playedFrom != null && placement == playedFrom && retries < 2 &&
+                    SystemClock.uptimeMillis() - lastMoveAt > 5000L
+            if (placement == lastPlacement && retry.not()) {
+                busy = false
+                return
+            }
+            val ourTurn = if (placement == BoardRecognizer.START_PLACEMENT) white else rec.turn != 0
+            lastPlacement = placement
+            if (ourTurn.not()) {
+                status.text = "Авто: ход соперника"
+                arrow.move = null
+                arrow.invalidate()
+                busy = false
+                return
+            }
+        }
+        lastPlacement = placement
+        pos.white = white // ищем лучший ход для выбранной стороны
+        runEngine(pos, rec.msg + " ", placement, auto)
+    }
+
+    private fun runEngine(pos: Position, prefix: String, placement: String, auto: Boolean) {
+        status.text = prefix + "Думаю..."
+        val d = depths[level]
+        Thread {
+            val mv = Engine.best(pos, d)
+            handler.post { onBest(pos, mv, prefix, placement, auto) }
+        }.start()
+    }
+
+    private fun onBest(pos: Position, mv: Move?, prefix: String, placement: String, auto: Boolean) {
+        if (mv == null) {
+            status.text = prefix + "Нет ходов"
+            busy = false
+            return
+        }
+        if (autoPlay && auto) {
+            // стрелку не рисуем; ждём, чтобы соперник/анимация закончились, и перепроверяем позицию
+            arrow.move = null
+            arrow.invalidate()
+            status.text = "Автоход: нашёл ${fmt(mv)}, жду 2.5 с..."
+            handler.postDelayed({ confirmAndPlay(pos, mv, placement) }, 2500L)
+        } else {
+            arrow.move = mv
+            arrow.flip = playWhite.not()
+            arrow.invalidate()
+            status.text = prefix + "Лучший ход: ${fmt(mv)}"
+            busy = false
+        }
+    }
+
+    private fun confirmAndPlay(pos: Position, mv: Move, placement: String) {
+        if (autoPlay.not()) {
+            busy = false
+            return
+        }
+        captureBoard(false) { bmp, msg ->
+            if (bmp == null) {
+                busy = false
+                status.text = "Автоход: $msg"
+            } else {
+                val white = playWhite
+                Thread {
+                    val rec = BoardRecognizer.recognize(bmp, white, prefs)
+                    bmp.recycle()
                     handler.post {
-                        status.text = rec.msg
-                        busy = false
+                        val p2 = rec.fen?.substringBefore(' ')
+                        if (p2 == placement) {
+                            executeMove(pos, mv, placement)
+                        } else {
+                            status.text = "Автоход: позиция изменилась, пересчитаю"
+                            lastPlacement = null
+                            busy = false
+                        }
                     }
                 }.start()
             }
         }
     }
 
-    // ---------- «Сканировать» ----------
+    private fun sqCenter(sq: Int): FloatArray {
+        val f = sq % 8
+        val r = sq / 8
+        val b = arrow.board
+        val fl = playWhite.not()
+        val x = b.left + ((if (fl) 7 - f else f) + 0.5f) * b.width() / 8f
+        val y = b.top + ((if (fl) 7 - r else r) + 0.5f) * b.height() / 8f
+        return floatArrayOf(x, y)
+    }
 
-    private fun scan() {
-        if (busy) return
-        if (BoardRecognizer.hasTemplates().not()) {
-            status.text = "Сначала нажми \"Запомнить эталоны\""
+    private fun executeMove(pos: Position, mv: Move, placementBefore: String) {
+        val ap = AutoPlayer.instance
+        if (ap == null) {
+            autoPlay = false
+            restartTick()
+            updateToggles()
+            status.text = "Автоход: служба «Chess AutoPlayer» не включена (Специальные возможности)."
+            openAccessibilitySettings()
+            busy = false
             return
         }
-        if (prepare().not()) return
-        busy = true
-        arrow.move = null
-        arrow.invalidate()
-        status.text = "Скриншот..."
-        captureBoard { bmp, msg ->
-            if (bmp == null) {
+        val a = sqCenter(mv.from)
+        val b = sqCenter(mv.to)
+        setTouchable(false)
+        status.text = "Автоход: делаю ${fmt(mv)}..."
+        ap.playMove(a[0], a[1], b[0], b[1], mv.promo != ' ') { ok ->
+            handler.post {
+                setTouchable(true)
+                lastMoveAt = SystemClock.uptimeMillis()
+                if (ok) {
+                    retries = if (playedFrom == placementBefore) retries + 1 else 0
+                    playedFrom = placementBefore
+                    afterOurMove = BoardRecognizer.placement(pos.make(mv).b)
+                    status.text = "Автоход: сделан ход ${fmt(mv)}"
+                } else {
+                    status.text = "Автоход: жест не выполнен"
+                }
                 busy = false
-                status.text = msg
-            } else {
-                status.text = "Распознаю доску..."
-                recognizeAndPlay(bmp)
             }
         }
-    }
-
-    private fun recognizeAndPlay(bmp: Bitmap) {
-        val white = playWhite
-        Thread {
-            val rec = BoardRecognizer.recognize(bmp, white)
-            bmp.recycle() // распознали — скриншот сразу удаляем из памяти
-            handler.post {
-                val fen = rec.fen
-                val pos = if (fen != null) Position.fromFen(fen) else null
-                if (fen == null) {
-                    status.text = rec.msg
-                    busy = false
-                } else if (pos == null) {
-                    status.text = "Получился некорректный FEN: $fen"
-                    busy = false
-                } else {
-                    pos.white = white // ищем лучший ход для выбранной стороны
-                    runEngine(pos, rec.msg + " ")
-                }
-            }
-        }.start()
-    }
-
-    private fun runEngine(pos: Position, prefix: String) {
-        busy = true
-        status.text = prefix + "Думаю..."
-        val d = depths[level]
-        Thread {
-            val mv = Engine.best(pos, d)
-            handler.post {
-                arrow.move = mv
-                arrow.flip = playWhite.not()
-                arrow.invalidate()
-                status.text = prefix + (if (mv == null) "Нет ходов" else "Лучший ход: $mv")
-                busy = false
-            }
-        }.start()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        handler.removeCallbacksAndMessages(null)
         releaseProjection()
         cleanupOldScreens()
         try {
