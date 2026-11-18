@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -15,6 +16,7 @@ import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -22,7 +24,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
@@ -58,7 +63,20 @@ class OverlayService : Service() {
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var vdisplay: VirtualDisplay? = null
+    private var lastImg: Image? = null
+    private var lastFrameAt = 0L
     private var busy = false
+
+    // ожидание FEN после нажатия «Анализ»
+    private var awaitingFen = false
+    private val fenRunnable = Runnable { fenReady() }
+
+    private val fenRe = Regex(
+        "([pnbrqkPNBRQK1-8]{1,8}/){7}[pnbrqkPNBRQK1-8]{1,8}" +
+                "(\\s+[wb](\\s+[KQkq-]{1,4}(\\s+(-|[a-h][36])(\\s+\\d+(\\s+\\d+)?)?)?)?)?"
+    )
+
+    private fun extractFen(t: String): String? = fenRe.find(t.replace('_', ' '))?.value?.trim()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -117,7 +135,6 @@ class OverlayService : Service() {
     // ---------- доска (SharedPreferences) ----------
 
     private fun loadBoard() {
-        // область доски автоматически подгружается при старте сервиса
         arrow.board = RectF(
             prefs.getFloat("bl", 0f), prefs.getFloat("bt", 0f),
             prefs.getFloat("br", 0f), prefs.getFloat("bb", 0f)
@@ -192,6 +209,14 @@ class OverlayService : Service() {
         else menuLp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         try {
             wm.updateViewLayout(menu, menuLp)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun hideIme() {
+        try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(fenEdit.windowToken, 0)
         } catch (e: Exception) {
         }
     }
@@ -284,16 +309,33 @@ class OverlayService : Service() {
             prefs.edit().putInt("level", level).apply()
         })
 
-        body.addView(btn("Выбрать доску") { startBoardSelect() })
+        // Анализ | Вставить FEN
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val lpA = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        lpA.setMargins(dp(2), dp(6), dp(2), dp(2))
+        actions.addView(btn("Анализ") { analyze() }, lpA)
+        actions.addView(btn("Вставить FEN") { pasteFen() }, LinearLayout.LayoutParams(lpA))
+        body.addView(actions)
+
+        status = label("")
+        status.setPadding(0, dp(4), 0, dp(4))
+        body.addView(status)
 
         body.addView(label("FEN позиции:"))
         fenEdit = EditText(this).apply {
-            setText(Position.START)
-            textSize = 11f
+            textSize = 12f
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            setSingleLine(true)
+            hint = "Вставь FEN сюда"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 3
+            maxLines = 5
+            gravity = Gravity.TOP or Gravity.START
+            setHorizontallyScrolling(false)
+            background = roundBg(Color.parseColor("#FF2A2A2A"), 8)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setText(Position.START)
             setOnTouchListener { v, e ->
                 if (e.action == MotionEvent.ACTION_DOWN) {
                     setMenuFocusable(true)
@@ -305,18 +347,25 @@ class OverlayService : Service() {
                 }
                 false
             }
+            // как только в поле появился валидный FEN (после «Анализ») — движок стартует сам
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    handler.removeCallbacks(fenRunnable)
+                    if (awaitingFen) handler.postDelayed(fenRunnable, 700)
+                }
+            })
         }
         body.addView(fenEdit)
 
-        body.addView(btn("Анализ") { analyze() })
+        body.addView(btn("Выбрать доску") { startBoardSelect() })
         body.addView(btn("Очистить стрелку") {
             arrow.move = null
             arrow.invalidate()
             status.text = ""
         })
         body.addView(btn("Закрыть сервис") { stopSelf() })
-        status = label("")
-        body.addView(status)
 
         val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
@@ -336,7 +385,7 @@ class OverlayService : Service() {
         if (menuShown.not()) setMenuFocusable(false)
     }
 
-    /** Показать/скрыть весь наш UI (нужно, чтобы он не попал в скриншот). Состояние меню не теряется. */
+    /** Показать/скрыть весь наш UI (чтобы он не попал в скриншот). Состояние меню не теряется. */
     private fun setUiVisible(v: Boolean) {
         val vis = if (v) View.VISIBLE else View.INVISIBLE
         arrow.visibility = vis
@@ -374,7 +423,7 @@ class OverlayService : Service() {
             }
         }
         selectView = null
-        setUiVisible(true) // меню возвращается на место без перезапуска сервиса
+        setUiVisible(true)
     }
 
     // ---------- захват экрана ----------
@@ -399,7 +448,20 @@ class OverlayService : Service() {
                 }
             }, handler)
             val sz = realSize()
-            val ir = ImageReader.newInstance(sz[0], sz[1], PixelFormat.RGBA_8888, 2)
+            val ir = ImageReader.newInstance(sz[0], sz[1], PixelFormat.RGBA_8888, 3)
+            // Всегда держим самый свежий кадр и время его прихода — так мы точно знаем,
+            // что снимок сделан ПОСЛЕ скрытия интерфейса, а не из старого буфера.
+            ir.setOnImageAvailableListener({ r ->
+                try {
+                    val img = r.acquireLatestImage()
+                    if (img != null) {
+                        lastImg?.close()
+                        lastImg = img
+                        lastFrameAt = SystemClock.uptimeMillis()
+                    }
+                } catch (e: Exception) {
+                }
+            }, handler)
             vdisplay = mp.createVirtualDisplay(
                 "chess_capture", sz[0], sz[1], resources.displayMetrics.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir.surface, null, handler
@@ -413,6 +475,11 @@ class OverlayService : Service() {
     }
 
     private fun releaseProjection() {
+        try {
+            lastImg?.close()
+        } catch (e: Exception) {
+        }
+        lastImg = null
         try {
             vdisplay?.release()
         } catch (e: Exception) {
@@ -435,50 +502,52 @@ class OverlayService : Service() {
         }
     }
 
-    /** Прячет оверлей, берёт кадр экрана, вырезает область доски и сохраняет last_board.png. */
+    /**
+     * Прячет меню, ♞ и стрелку (INVISIBLE) на 500 мс, берёт свежий кадр экрана,
+     * вырезает область доски, сохраняет last_board.png и только потом возвращает интерфейс.
+     */
     private fun captureBoard(done: (String) -> Unit) {
-        val ir = reader
-        if (ir == null) {
+        if (reader == null) {
             done("")
             return
         }
         val b = RectF(arrow.board)
+        val hideAt = SystemClock.uptimeMillis()
         setUiVisible(false)
-        handler.postDelayed({ grab(ir, b, 0, done) }, 300)
+        handler.postDelayed({ grab(b, hideAt, 0, done) }, 500)
     }
 
-    private fun grab(ir: ImageReader, b: RectF, attempt: Int, done: (String) -> Unit) {
-        val img = try {
-            ir.acquireLatestImage()
-        } catch (e: Exception) {
-            null
-        }
-        if (img == null) {
-            if (attempt < 8) handler.postDelayed({ grab(ir, b, attempt + 1, done) }, 150)
-            else {
-                setUiVisible(true)
-                done("Нет кадра экрана.\n")
-            }
+    private fun grab(b: RectF, hideAt: Long, attempt: Int, done: (String) -> Unit) {
+        val cur = lastImg
+        val fresh = cur != null && lastFrameAt >= hideAt + 80
+        if (fresh.not() && attempt < 10) {
+            handler.postDelayed({ grab(b, hideAt, attempt + 1, done) }, 150)
             return
         }
+        if (cur == null) {
+            setUiVisible(true)
+            done("Нет кадра экрана.\n")
+            return
+        }
+        lastImg = null // забираем кадр себе
         var bmp: Bitmap? = null
         try {
-            val plane = img.planes[0]
+            val plane = cur.planes[0]
             val bw = plane.rowStride / plane.pixelStride
-            val full = Bitmap.createBitmap(bw, img.height, Bitmap.Config.ARGB_8888)
+            val full = Bitmap.createBitmap(bw, cur.height, Bitmap.Config.ARGB_8888)
             full.copyPixelsFromBuffer(plane.buffer)
-            val l = b.left.toInt().coerceIn(0, img.width - 2)
-            val t = b.top.toInt().coerceIn(0, img.height - 2)
-            val w = b.width().toInt().coerceAtMost(img.width - l).coerceAtLeast(1)
-            val h = b.height().toInt().coerceAtMost(img.height - t).coerceAtLeast(1)
+            val l = b.left.toInt().coerceIn(0, cur.width - 2)
+            val t = b.top.toInt().coerceIn(0, cur.height - 2)
+            val w = b.width().toInt().coerceAtMost(cur.width - l).coerceAtLeast(1)
+            val h = b.height().toInt().coerceAtMost(cur.height - t).coerceAtLeast(1)
             bmp = Bitmap.createBitmap(full, l, t, w, h)
             full.recycle()
         } catch (e: Exception) {
             bmp = null
         } finally {
-            img.close()
+            cur.close()
         }
-        setUiVisible(true) // меню остаётся на месте
+        setUiVisible(true) // всё возвращается на место, меню не сбрасывается
         val out = bmp
         if (out == null) {
             done("Ошибка скрина.\n")
@@ -489,7 +558,7 @@ class OverlayService : Service() {
             try {
                 val f = File(getExternalFilesDir(null) ?: filesDir, "last_board.png")
                 FileOutputStream(f).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                msg = "Скрин доски сохранён (${out.width}x${out.height}):\n${f.absolutePath}\n"
+                msg = "Скрин доски сохранён (${out.width}x${out.height}).\n"
             } catch (e: Exception) {
                 msg = "Не удалось сохранить скрин.\n"
             }
@@ -497,29 +566,88 @@ class OverlayService : Service() {
         }.start()
     }
 
+    // ---------- FEN: вставка и автозапуск ----------
+
+    private fun pasteFen() {
+        // На Android 10+ буфер обмена читается только окном с фокусом ввода — даём его меню на мгновение
+        setMenuFocusable(true)
+        status.text = "Читаю буфер обмена..."
+        handler.postDelayed({ readClip(0) }, 250)
+    }
+
+    private fun readClip(attempt: Int) {
+        var txt: String? = null
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip
+            if (clip != null && clip.itemCount > 0) txt = clip.getItemAt(0).coerceToText(this)?.toString()
+        } catch (e: Exception) {
+            txt = null
+        }
+        if ((txt == null || txt.isBlank()) && attempt < 2) {
+            handler.postDelayed({ readClip(attempt + 1) }, 250)
+            return
+        }
+        hideIme()
+        setMenuFocusable(false)
+        if (txt == null || txt.isBlank()) {
+            status.text = "Буфер обмена пуст или недоступен"
+            return
+        }
+        val fen = extractFen(txt)
+        if (fen == null) {
+            status.text = "В буфере не нашёл FEN"
+            return
+        }
+        // если «Анализ» не нажимали — всё равно запускаем движок сразу после вставки
+        awaitingFen = true
+        fenEdit.setText(fen) // TextWatcher запустит анализ автоматически
+    }
+
+    /** Вызывается через 700 мс после последнего изменения поля, пока ждём FEN. */
+    private fun fenReady() {
+        if (awaitingFen.not() || busy) return
+        val fen = extractFen(fenEdit.text.toString()) ?: return
+        val pos = Position.fromFen(fen) ?: return
+        awaitingFen = false
+        hideIme()
+        setMenuFocusable(false)
+        pos.white = playWhite // ищем лучший ход для выбранной стороны
+        runEngine(pos, "")
+    }
+
     // ---------- анализ ----------
 
     private fun analyze() {
+        hideIme()
         setMenuFocusable(false)
         if (busy) return
-        val pos = Position.fromFen(fenEdit.text.toString())
-        if (pos == null) {
-            status.text = "Неверный FEN"
-            return
-        }
-        pos.white = playWhite // ищем лучший ход для выбранной стороны
+        // очищаем старую стрелку и старый FEN — анализ пойдёт только по новому
+        handler.removeCallbacks(fenRunnable)
+        awaitingFen = false
+        arrow.move = null
+        arrow.invalidate()
+        fenEdit.setText("")
         if (hasBoard().not()) {
-            runEngine(pos, "Доска не выбрана — нажми «Выбрать доску».\n")
+            waitForFen("Доска не выбрана — нажми «Выбрать доску».\n")
             return
         }
         if (reader == null) {
             requestCapture()
-            runEngine(pos, "Разреши захват экрана и нажми Анализ ещё раз.\n")
+            waitForFen("Разреши захват экрана и снова нажми Анализ.\n")
             return
         }
         busy = true
         status.text = "Скриншот..."
-        captureBoard { msg -> runEngine(pos, msg) }
+        captureBoard { msg ->
+            busy = false
+            waitForFen(msg)
+        }
+    }
+
+    private fun waitForFen(prefix: String) {
+        awaitingFen = true
+        status.text = prefix + "Вставь FEN («Вставить FEN») — анализ запустится сам."
     }
 
     private fun runEngine(pos: Position, prefix: String) {
@@ -540,6 +668,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        handler.removeCallbacks(fenRunnable)
         releaseProjection()
         try {
             projection?.stop()
