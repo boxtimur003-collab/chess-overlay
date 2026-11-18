@@ -2,46 +2,123 @@ package com.example.chessoverlay
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
+import android.view.MotionEvent
 import android.view.View
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.sin
 
-class ArrowView(c: Context) : View(c) {
-    var bx = 0f; var by = 0f; var bs = 0f
+/** Рисует стрелку лучшего хода поверх доски. flip=true — доска перевёрнута (играем за чёрных). */
+class ArrowView(ctx: Context) : View(ctx) {
+    var board = RectF()
     var flip = false
-    var frame = false
-    var from = -1; var to = -1
+    var move: Move? = null
 
-    private val pf = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFEB3B.toInt(); style = Paint.Style.STROKE; strokeWidth = 4f }
-    private val pg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x66FFEB3B; style = Paint.Style.STROKE; strokeWidth = 1.5f }
-    private val pa = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCCE53935.toInt(); style = Paint.Style.STROKE; strokeWidth = 18f; strokeCap = Paint.Cap.ROUND }
-    private val ph = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCCE53935.toInt(); style = Paint.Style.FILL }
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(210, 0, 200, 83)
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(210, 0, 200, 83)
+        style = Paint.Style.FILL
+    }
 
-    private fun cx(s: Int): Float { val f = s % 8; return bx + ((if (flip) 7 - f else f) + 0.5f) * bs / 8 }
-    private fun cy(s: Int): Float { val r = s / 8; return by + ((if (flip) r else 7 - r) + 0.5f) * bs / 8 }
+    private fun cx(sq: Int): Float {
+        val f = sq % 8
+        return board.left + ((if (flip) 7 - f else f) + 0.5f) * board.width() / 8f
+    }
 
-    override fun onDraw(cv: Canvas) {
-        if (frame) {
-            for (i in 1..7) {
-                cv.drawLine(bx + i * bs / 8, by, bx + i * bs / 8, by + bs, pg)
-                cv.drawLine(bx, by + i * bs / 8, bx + bs, by + i * bs / 8, pg)
+    private fun cy(sq: Int): Float {
+        val r = sq / 8
+        return board.top + ((if (flip) 7 - r else r) + 0.5f) * board.height() / 8f
+    }
+
+    override fun onDraw(c: Canvas) {
+        val m = move ?: return
+        if (board.width() < 8f || board.height() < 8f) return
+        val x1 = cx(m.from)
+        val y1 = cy(m.from)
+        val x2 = cx(m.to)
+        val y2 = cy(m.to)
+        val cell = board.width() / 8f
+        line.strokeWidth = cell * 0.16f
+        val ang = atan2((y2 - y1).toDouble(), (x2 - x1).toDouble())
+        val head = cell * 0.4f
+        val bx = x2 - (head * 0.8f * cos(ang)).toFloat()
+        val by = y2 - (head * 0.8f * sin(ang)).toFloat()
+        c.drawCircle(x1, y1, cell * 0.14f, fill)
+        c.drawLine(x1, y1, bx, by, line)
+        val p = Path()
+        p.moveTo(x2, y2)
+        val a1 = ang + Math.PI * 5 / 6
+        val a2 = ang - Math.PI * 5 / 6
+        p.lineTo(x2 + (head * cos(a1)).toFloat(), y2 + (head * sin(a1)).toFloat())
+        p.lineTo(x2 + (head * cos(a2)).toFloat(), y2 + (head * sin(a2)).toFloat())
+        p.close()
+        c.drawPath(p, fill)
+    }
+}
+
+/** Полноэкранное затемнение: палец проводит прямоугольник от левого верхнего к правому нижнему углу доски. */
+class BoardSelectView(ctx: Context, private val onDone: (RectF) -> Unit) : View(ctx) {
+    private var sx = 0f
+    private var sy = 0f
+    private var ex = 0f
+    private var ey = 0f
+    private var drawing = false
+
+    private val frame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(255, 0, 200, 83)
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+    private val inner = Paint().apply { color = Color.argb(50, 0, 200, 83) }
+    private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 42f
+        textAlign = Paint.Align.CENTER
+    }
+
+    init {
+        setBackgroundColor(Color.argb(150, 0, 0, 0))
+    }
+
+    override fun onDraw(c: Canvas) {
+        c.drawText("Проведите от левого верхнего", width / 2f, 140f, txt)
+        c.drawText("до правого нижнего угла доски", width / 2f, 200f, txt)
+        if (drawing) {
+            val r = RectF(minOf(sx, ex), minOf(sy, ey), maxOf(sx, ex), maxOf(sy, ey))
+            c.drawRect(r, inner)
+            c.drawRect(r, frame)
+        }
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.action) {
+            MotionEvent.ACTION_DOWN -> {
+                sx = e.x; sy = e.y; ex = e.x; ey = e.y
+                drawing = true
+                invalidate()
             }
-            cv.drawRect(bx, by, bx + bs, by + bs, pf)
+            MotionEvent.ACTION_MOVE -> {
+                ex = e.x; ey = e.y
+                invalidate()
+            }
+            MotionEvent.ACTION_UP -> {
+                ex = e.x; ey = e.y
+                val r = RectF(minOf(sx, ex), minOf(sy, ey), maxOf(sx, ex), maxOf(sy, ey))
+                if (r.width() > 100f && r.height() > 100f) onDone(r)
+                else {
+                    drawing = false
+                    invalidate()
+                }
+            }
         }
-        if (from >= 0 && to >= 0) {
-            val x1 = cx(from); val y1 = cy(from); val x2 = cx(to); val y2 = cy(to)
-            val a = atan2(y2 - y1, x2 - x1)
-            val head = bs / 8 * 0.5f
-            cv.drawLine(x1, y1, x2 - cos(a) * head * 0.8f, y2 - sin(a) * head * 0.8f, pa)
-            val path = Path()
-            path.moveTo(x2, y2)
-            path.lineTo(x2 - head * cos(a - 0.5f), y2 - head * sin(a - 0.5f))
-            path.lineTo(x2 - head * cos(a + 0.5f), y2 - head * sin(a + 0.5f))
-            path.close()
-            cv.drawPath(path, ph)
-        }
+        return true
     }
 }
