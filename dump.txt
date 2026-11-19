@@ -1,0 +1,1916 @@
+=== Chess.kt
+package com.example.chessoverlay
+
+import kotlin.math.abs
+import kotlin.math.max
+
+data class Move(val from: Int, val to: Int, val promo: Char = ' ') {
+    override fun toString(): String {
+        val s = "" + ('a' + from % 8) + (8 - from / 8) + ('a' + to % 8) + (8 - to / 8)
+        return if (promo != ' ') s + promo else s
+    }
+}
+
+class Position(
+    val b: CharArray = CharArray(64) { '.' },
+    var white: Boolean = true,
+    var castle: String = "KQkq",
+    var ep: Int = -1
+) {
+    companion object {
+        private val DIRS = arrayOf(
+            intArrayOf(-1, 0), intArrayOf(1, 0), intArrayOf(0, -1), intArrayOf(0, 1),
+            intArrayOf(-1, -1), intArrayOf(-1, 1), intArrayOf(1, -1), intArrayOf(1, 1)
+        )
+        private val KN = arrayOf(
+            intArrayOf(-2, -1), intArrayOf(-2, 1), intArrayOf(-1, -2), intArrayOf(-1, 2),
+            intArrayOf(1, -2), intArrayOf(1, 2), intArrayOf(2, -1), intArrayOf(2, 1)
+        )
+        const val START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+        fun fromFen(fen: String): Position? {
+            try {
+                val p = fen.trim().split(Regex("\\s+"))
+                val rows = p[0].split("/")
+                if (rows.size != 8) return null
+                val pos = Position()
+                for (r in 0 until 8) {
+                    var f = 0
+                    for (c in rows[r]) {
+                        if (c.isDigit()) f += c - '0'
+                        else {
+                            if (f > 7 || "pnbrqkPNBRQK".indexOf(c) < 0) return null
+                            pos.b[r * 8 + f] = c
+                            f++
+                        }
+                    }
+                    if (f != 8) return null
+                }
+                pos.white = p.getOrElse(1) { "w" } == "w"
+                val cs = p.getOrElse(2) { "-" }
+                pos.castle = if (cs == "-") "" else cs
+                val e = p.getOrElse(3) { "-" }
+                pos.ep = if (e.length == 2) (8 - (e[1] - '0')) * 8 + (e[0] - 'a') else -1
+                if (pos.b.indexOf('K') < 0 || pos.b.indexOf('k') < 0) return null
+                return pos
+            } catch (ex: Exception) {
+                return null
+            }
+        }
+    }
+
+    private fun addPawn(res: MutableList<Move>, from: Int, to: Int, promo: Boolean) {
+        if (promo) {
+            for (p in "qrbn") res.add(Move(from, to, p))
+        } else res.add(Move(from, to))
+    }
+
+    fun pseudo(side: Boolean): MutableList<Move> {
+        val res = ArrayList<Move>()
+        for (sq in 0 until 64) {
+            val c = b[sq]
+            if (c == '.' || c.isUpperCase() != side) continue
+            val r = sq / 8
+            val f = sq % 8
+            when (c.lowercaseChar()) {
+                'p' -> {
+                    // белые идут вверх (row уменьшается), чёрные вниз (row растёт)
+                    val dir = if (side) -1 else 1
+                    val startRow = if (side) 6 else 1
+                    val lastRow = if (side) 0 else 7
+                    val r1 = r + dir
+                    if (r1 in 0..7) {
+                        // прямо — только на пустую клетку
+                        if (b[r1 * 8 + f] == '.') {
+                            addPawn(res, sq, r1 * 8 + f, r1 == lastRow)
+                            val r2 = r + 2 * dir
+                            if (r == startRow && b[r2 * 8 + f] == '.') res.add(Move(sq, r2 * 8 + f))
+                        }
+                        // по диагонали — только взятие (или en passant)
+                        for (df in intArrayOf(-1, 1)) {
+                            val nf = f + df
+                            if (nf < 0 || nf > 7) continue
+                            val t = r1 * 8 + nf
+                            val tc = b[t]
+                            if (tc != '.' && tc.isUpperCase() != side) {
+                                addPawn(res, sq, t, r1 == lastRow)
+                            } else if (tc == '.' && t == ep) {
+                                val victim = b[r * 8 + nf]
+                                if (victim.lowercaseChar() == 'p' && victim.isUpperCase() != side) res.add(Move(sq, t))
+                            }
+                        }
+                    }
+                }
+                'n' -> for (d in KN) {
+                    val nr = r + d[0]
+                    val nf = f + d[1]
+                    if (nr < 0 || nr > 7 || nf < 0 || nf > 7) continue
+                    val tc = b[nr * 8 + nf]
+                    if (tc == '.' || tc.isUpperCase() != side) res.add(Move(sq, nr * 8 + nf))
+                }
+                'k' -> {
+                    for (d in DIRS) {
+                        val nr = r + d[0]
+                        val nf = f + d[1]
+                        if (nr < 0 || nr > 7 || nf < 0 || nf > 7) continue
+                        val tc = b[nr * 8 + nf]
+                        if (tc == '.' || tc.isUpperCase() != side) res.add(Move(sq, nr * 8 + nf))
+                    }
+                    val base = if (side) 56 else 0
+                    val ks = if (side) "K" else "k"
+                    val qs = if (side) "Q" else "q"
+                    if (sq == base + 4 && attacked(sq, side.not()).not()) {
+                        if (castle.contains(ks) && b[base + 7] == (if (side) 'R' else 'r') &&
+                            b[base + 5] == '.' && b[base + 6] == '.' &&
+                            attacked(base + 5, side.not()).not() && attacked(base + 6, side.not()).not()
+                        ) res.add(Move(sq, base + 6))
+                        if (castle.contains(qs) && b[base] == (if (side) 'R' else 'r') &&
+                            b[base + 1] == '.' && b[base + 2] == '.' && b[base + 3] == '.' &&
+                            attacked(base + 3, side.not()).not() && attacked(base + 2, side.not()).not()
+                        ) res.add(Move(sq, base + 2))
+                    }
+                }
+                else -> {
+                    val lc = c.lowercaseChar()
+                    for (i in 0 until 8) {
+                        if (lc == 'b' && i < 4) continue
+                        if (lc == 'r' && i >= 4) continue
+                        var nr = r + DIRS[i][0]
+                        var nf = f + DIRS[i][1]
+                        while (nr in 0..7 && nf in 0..7) {
+                            val tc = b[nr * 8 + nf]
+                            if (tc == '.') res.add(Move(sq, nr * 8 + nf))
+                            else {
+                                if (tc.isUpperCase() != side) res.add(Move(sq, nr * 8 + nf))
+                                break
+                            }
+                            nr += DIRS[i][0]
+                            nf += DIRS[i][1]
+                        }
+                    }
+                }
+            }
+        }
+        return res
+    }
+
+    fun attacked(sq: Int, by: Boolean): Boolean {
+        val r = sq / 8
+        val f = sq % 8
+        val pr = if (by) r + 1 else r - 1
+        if (pr in 0..7) {
+            for (df in intArrayOf(-1, 1)) {
+                val nf = f + df
+                if (nf in 0..7 && b[pr * 8 + nf] == (if (by) 'P' else 'p')) return true
+            }
+        }
+        for (d in KN) {
+            val nr = r + d[0]
+            val nf = f + d[1]
+            if (nr in 0..7 && nf in 0..7 && b[nr * 8 + nf] == (if (by) 'N' else 'n')) return true
+        }
+        for (d in DIRS) {
+            val nr = r + d[0]
+            val nf = f + d[1]
+            if (nr in 0..7 && nf in 0..7 && b[nr * 8 + nf] == (if (by) 'K' else 'k')) return true
+        }
+        for (i in 0 until 8) {
+            var nr = r + DIRS[i][0]
+            var nf = f + DIRS[i][1]
+            while (nr in 0..7 && nf in 0..7) {
+                val tc = b[nr * 8 + nf]
+                if (tc != '.') {
+                    if (tc.isUpperCase() == by) {
+                        val l = tc.lowercaseChar()
+                        if (l == 'q' || (l == 'r' && i < 4) || (l == 'b' && i >= 4)) return true
+                    }
+                    break
+                }
+                nr += DIRS[i][0]
+                nf += DIRS[i][1]
+            }
+        }
+        return false
+    }
+
+    fun inCheck(side: Boolean): Boolean {
+        val k = b.indexOf(if (side) 'K' else 'k')
+        return k >= 0 && attacked(k, side.not())
+    }
+
+    fun make(m: Move): Position {
+        val n = Position(b.copyOf(), white.not(), castle, -1)
+        val c = n.b[m.from]
+        val w = c.isUpperCase()
+        val tc = n.b[m.to]
+        n.b[m.to] = c
+        n.b[m.from] = '.'
+        if (m.promo != ' ') n.b[m.to] = if (w) m.promo.uppercaseChar() else m.promo.lowercaseChar()
+        val fr = m.from / 8
+        val ff = m.from % 8
+        val tr = m.to / 8
+        val tf = m.to % 8
+        if (c.lowercaseChar() == 'p') {
+            if (m.to == ep && ff != tf && tc == '.') n.b[fr * 8 + tf] = '.'
+            if (abs(tr - fr) == 2) n.ep = ((fr + tr) / 2) * 8 + ff
+        }
+        if (c.lowercaseChar() == 'k' && abs(tf - ff) == 2) {
+            if (tf == 6) {
+                n.b[tr * 8 + 5] = n.b[tr * 8 + 7]
+                n.b[tr * 8 + 7] = '.'
+            } else {
+                n.b[tr * 8 + 3] = n.b[tr * 8]
+                n.b[tr * 8] = '.'
+            }
+        }
+        var cs = castle
+        if (c == 'K') cs = cs.replace("K", "").replace("Q", "")
+        if (c == 'k') cs = cs.replace("k", "").replace("q", "")
+        for (s in intArrayOf(m.from, m.to)) {
+            when (s) {
+                63 -> cs = cs.replace("K", "")
+                56 -> cs = cs.replace("Q", "")
+                7 -> cs = cs.replace("k", "")
+                0 -> cs = cs.replace("q", "")
+            }
+        }
+        n.castle = cs
+        return n
+    }
+
+    fun legal(): List<Move> = pseudo(white).filter { m ->
+        val n = make(m)
+        n.inCheck(white).not()
+    }
+}
+
+object Engine {
+    private class TimeUp : RuntimeException()
+
+    private var deadline = 0L
+    private var nodes = 0
+
+    private fun tick() {
+        nodes++
+        if ((nodes and 1023) == 0 && System.currentTimeMillis() > deadline) throw TimeUp()
+    }
+
+    private fun value(c: Char): Int = when (c.lowercaseChar()) {
+        'p' -> 100; 'n' -> 320; 'b' -> 330; 'r' -> 500; 'q' -> 900; else -> 0
+    }
+
+    private fun eval(p: Position): Int {
+        var s = 0
+        for (sq in 0 until 64) {
+            val c = p.b[sq]
+            if (c == '.') continue
+            val r = sq / 8
+            val f = sq % 8
+            var v = value(c)
+            val l = c.lowercaseChar()
+            if (l == 'p' || l == 'n' || l == 'b') {
+                val dist = abs(r - 3.5) + abs(f - 3.5)
+                v += (10 - dist * 3).toInt()
+            }
+            if (l == 'p') v += if (c.isUpperCase()) (6 - r) * 4 else (r - 1) * 4
+            s += if (c.isUpperCase()) v else -v
+        }
+        return if (p.white) s else -s
+    }
+
+    private fun order(p: Position, moves: List<Move>): List<Move> =
+        moves.sortedByDescending { m ->
+            val t = p.b[m.to]
+            (if (t != '.') value(t) * 10 - value(p.b[m.from]) else 0) + (if (m.promo == 'q') 800 else 0)
+        }
+
+    private fun qsearch(p: Position, alpha0: Int, beta: Int, qd: Int): Int {
+        tick()
+        val stand = eval(p)
+        if (qd <= 0) return stand
+        if (stand >= beta) return beta
+        var alpha = max(alpha0, stand)
+        val caps = p.pseudo(p.white).filter { p.b[it.to] != '.' || it.promo == 'q' }
+        for (m in order(p, caps)) {
+            val n = p.make(m)
+            if (n.inCheck(p.white)) continue
+            val s = -qsearch(n, -beta, -alpha, qd - 1)
+            if (s >= beta) return beta
+            if (s > alpha) alpha = s
+        }
+        return alpha
+    }
+
+    private fun search(p: Position, d: Int, alpha0: Int, beta: Int, ply: Int): Int {
+        tick()
+        if (d <= 0) return qsearch(p, alpha0, beta, 3)
+        val ms = p.legal()
+        if (ms.isEmpty()) return if (p.inCheck(p.white)) -100000 + ply else 0
+        var alpha = alpha0
+        for (m in order(p, ms)) {
+            val s = -search(p.make(m), d - 1, -beta, -alpha, ply + 1)
+            if (s >= beta) return beta
+            if (s > alpha) alpha = s
+        }
+        return alpha
+    }
+
+    /** Итеративное углубление до depth; при нехватке времени возвращает лучший ход предыдущей глубины. */
+    fun best(pos: Position, depth: Int, timeMs: Long = 8000L): Move? {
+        deadline = System.currentTimeMillis() + timeMs
+        nodes = 0
+        var ms = order(pos, pos.legal())
+        if (ms.isEmpty()) return null
+        var best: Move = ms[0]
+        for (d in 1..depth) {
+            try {
+                var alpha = -1000000
+                var cur: Move? = null
+                for (m in ms) {
+                    val s = -search(pos.make(m), d - 1, -1000000, -alpha, 1)
+                    if (cur == null || s > alpha) {
+                        alpha = s
+                        cur = m
+                    }
+                }
+                if (cur != null) {
+                    best = cur
+                    val c = cur
+                    ms = listOf(c) + ms.filter { it != c }
+                }
+            } catch (e: TimeUp) {
+                break
+            }
+        }
+        return best
+    }
+}
+=== OverlayService.kt
+package com.example.chessoverlay
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.Image
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
+import android.util.DisplayMetrics
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import java.io.File
+
+class OverlayService : Service() {
+    private lateinit var wm: WindowManager
+    private lateinit var prefs: SharedPreferences
+    private lateinit var arrow: ArrowView
+    private lateinit var bubble: TextView
+    private lateinit var menu: LinearLayout
+    private lateinit var bubbleLp: WindowManager.LayoutParams
+    private lateinit var menuLp: WindowManager.LayoutParams
+    private lateinit var status: TextView
+    private lateinit var btnAutoCap: Button
+    private lateinit var btnAutoPlay: Button
+    private var menuShown = false
+    private var selectView: BoardSelectView? = null
+    private var level = 1 // 0 = Легкий, 1 = Средний, 2 = Сложный
+    private var playWhite = true
+    private val depths = intArrayOf(1, 3, 4)
+    private val handler = Handler(Looper.getMainLooper())
+
+    // захват экрана (кадры живут только в оперативной памяти)
+    private var projection: MediaProjection? = null
+    private var reader: ImageReader? = null
+    private var vdisplay: VirtualDisplay? = null
+    private var lastImg: Image? = null
+    private var lastFrameAt = 0L
+    private var busy = false
+
+    // автоматика
+    private var autoCapture = false
+    private var autoPlay = false
+    private var lastPlacement: String? = null
+    private var afterOurMove: String? = null
+    private var playedFrom: String? = null
+    private var lastMoveAt = 0L
+    private var retries = 0
+    private val tick = object : Runnable {
+        override fun run() {
+            autoTick()
+            if (autoCapture || autoPlay) handler.postDelayed(this, 4000L)
+        }
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun overlayType() =
+        if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+    private fun params(w: Int, h: Int, flags: Int): WindowManager.LayoutParams {
+        val lp = WindowManager.LayoutParams(w, h, overlayType(), flags, PixelFormat.TRANSLUCENT)
+        lp.gravity = Gravity.TOP or Gravity.START
+        if (Build.VERSION.SDK_INT >= 28) {
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        return lp
+    }
+
+    override fun onBind(i: Intent?): IBinder? = null
+
+    /** Удаляем last_board.png, если он остался от старых версий. Скриншоты на диск не пишутся. */
+    private fun cleanupOldScreens() {
+        try {
+            File(getExternalFilesDir(null) ?: filesDir, "last_board.png").delete()
+        } catch (e: Exception) {
+        }
+        try {
+            File(filesDir, "last_board.png").delete()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun buildNotif(): Notification {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(NotificationChannel("chess_overlay", "Chess overlay", NotificationManager.IMPORTANCE_LOW))
+        }
+        val n = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "chess_overlay")
+        else @Suppress("DEPRECATION") Notification.Builder(this)
+        return n.setContentTitle("Chess overlay").setSmallIcon(android.R.drawable.ic_menu_compass).build()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "chess.PROJECTION") {
+            val code = intent.getIntExtra("code", 0)
+            val data: Intent? = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("data", Intent::class.java)
+            else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
+            if (data != null) startProjection(code, data)
+            return START_STICKY
+        }
+        try {
+            startForeground(1, buildNotif())
+        } catch (e: Exception) {
+        }
+        loadBoard()
+        return START_STICKY
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        prefs = getSharedPreferences("chess_overlay", Context.MODE_PRIVATE)
+        playWhite = prefs.getBoolean("playWhite", true)
+        level = prefs.getInt("level", 1).coerceIn(0, 2)
+        cleanupOldScreens()
+        BoardRecognizer.loadTemplates(prefs) // эталоны остаются после перезапуска
+        buildArrow()
+        buildBubble()
+        buildMenu()
+    }
+
+    // ---------- доска (SharedPreferences) ----------
+
+    private fun loadBoard() {
+        arrow.board = RectF(
+            prefs.getFloat("bl", 0f), prefs.getFloat("bt", 0f),
+            prefs.getFloat("br", 0f), prefs.getFloat("bb", 0f)
+        )
+        arrow.flip = playWhite.not()
+        arrow.showFrame = menuShown
+        arrow.invalidate()
+    }
+
+    private fun hasBoard() = arrow.board.width() > 100f && arrow.board.height() > 100f
+
+    // ---------- окна ----------
+
+    private fun buildArrow() {
+        arrow = ArrowView(this)
+        val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        wm.addView(arrow, params(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, f))
+        loadBoard()
+    }
+
+    private fun roundBg(color: Int, r: Int) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(r).toFloat()
+    }
+
+    private fun realSize(): IntArray {
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(dm)
+        return intArrayOf(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun makeDraggable(handle: View, lp: WindowManager.LayoutParams, target: View, onClick: (() -> Unit)?) {
+        var dx = 0f
+        var dy = 0f
+        var sx = 0
+        var sy = 0
+        var moved = false
+        handle.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y; moved = false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val mx = (e.rawX - dx).toInt()
+                    val my = (e.rawY - dy).toInt()
+                    if (Math.abs(mx) > dp(4) || Math.abs(my) > dp(4)) moved = true
+                    if (moved) {
+                        lp.x = sx + mx
+                        lp.y = sy + my
+                        wm.updateViewLayout(target, lp)
+                    }
+                }
+                MotionEvent.ACTION_UP -> if (moved.not()) onClick?.invoke()
+            }
+            true
+        }
+    }
+
+    /** Широкая плашка двигается только вверх/вниз. */
+    private fun makeVDraggable(handle: View, lp: WindowManager.LayoutParams, target: View) {
+        var dy = 0f
+        var sy = 0
+        handle.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    dy = e.rawY; sy = lp.y
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val maxY = maxOf(0, realSize()[1] - target.height)
+                    lp.y = (sy + (e.rawY - dy).toInt()).coerceIn(0, maxY)
+                    try {
+                        wm.updateViewLayout(target, lp)
+                    } catch (ex: Exception) {
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    private fun buildBubble() {
+        bubble = TextView(this).apply {
+            text = "♞"
+            textSize = 26f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = roundBg(Color.parseColor("#EE1E1E1E"), 28)
+        }
+        val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        bubbleLp = params(dp(56), dp(56), f)
+        bubbleLp.x = dp(8)
+        bubbleLp.y = dp(200)
+        wm.addView(bubble, bubbleLp)
+        makeDraggable(bubble, bubbleLp, bubble) { toggleMenu() }
+    }
+
+    private fun btn(t: String, color: String = "#FF3A3A3A", click: () -> Unit) = Button(this).apply {
+        text = t
+        isAllCaps = false
+        textSize = 12f
+        setTextColor(Color.WHITE)
+        background = roundBg(Color.parseColor(color), 10)
+        minHeight = 0
+        minimumHeight = dp(38)
+        setPadding(dp(6), 0, dp(6), 0)
+        setOnClickListener { click() }
+    }
+
+    private fun styleToggle(b: Button, label: String, on: Boolean) {
+        b.text = label + ": " + (if (on) "вкл" else "выкл")
+        b.background = roundBg(Color.parseColor(if (on) "#FF2E7D32" else "#FF3A3A3A"), 10)
+    }
+
+    private fun updateToggles() {
+        styleToggle(btnAutoCap, "Автозахват", autoCapture)
+        styleToggle(btnAutoPlay, "Автоход", autoPlay)
+    }
+
+    /** Сегментированный переключатель. */
+    private fun segmented(labels: List<String>, selected: Int, onSel: (Int) -> Unit): LinearLayout {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val tvs = ArrayList<TextView>()
+        fun paint(sel: Int) {
+            for ((i, tv) in tvs.withIndex()) {
+                tv.background = roundBg(Color.parseColor(if (i == sel) "#FF2E7D32" else "#FF3A3A3A"), 8)
+            }
+        }
+        labels.forEachIndexed { i, t ->
+            val tv = TextView(this).apply {
+                text = t
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(2), dp(9), dp(2), dp(9))
+                setOnClickListener {
+                    paint(i)
+                    onSel(i)
+                }
+            }
+            tvs.add(tv)
+            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            lp.setMargins(dp(2), 0, dp(2), 0)
+            row.addView(tv, lp)
+        }
+        paint(selected)
+        return row
+    }
+
+    private fun buildMenu() {
+        menu = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = roundBg(Color.parseColor("#EE1E1E1E"), 16)
+            visibility = View.GONE
+        }
+        val handle = TextView(this).apply {
+            text = "⋮⋮"
+            textSize = 16f
+            setTextColor(Color.LTGRAY)
+            gravity = Gravity.CENTER
+            background = roundBg(Color.parseColor("#FF2E2E2E"), 16)
+        }
+        menu.addView(handle, LinearLayout.LayoutParams(dp(26), LinearLayout.LayoutParams.MATCH_PARENT))
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+        menu.addView(content, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        // строка 1: цвет + сложность
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row1.addView(segmented(listOf("♙ Белые", "♟ Чёрные"), if (playWhite) 0 else 1) { i ->
+            playWhite = i == 0
+            prefs.edit().putBoolean("playWhite", playWhite).apply()
+            arrow.flip = playWhite.not()
+            arrow.move = null
+            arrow.invalidate()
+            lastPlacement = null
+            afterOurMove = null
+            playedFrom = null
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f))
+        row1.addView(segmented(listOf("Легкий", "Средний", "Сложный"), level) { i ->
+            level = i
+            prefs.edit().putInt("level", level).apply()
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 3f))
+        content.addView(row1)
+
+        fun lpB(w: Float): LinearLayout.LayoutParams {
+            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, w)
+            lp.setMargins(dp(2), dp(6), dp(2), dp(2))
+            return lp
+        }
+
+        // строка 2: автоматика
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnAutoCap = btn("Автозахват: выкл") { toggleAutoCapture() }
+        btnAutoPlay = btn("Автоход: выкл") { toggleAutoPlay() }
+        row2.addView(btnAutoCap, lpB(1f))
+        row2.addView(btnAutoPlay, lpB(1f))
+        content.addView(row2)
+
+        // строка 3: основные кнопки
+        val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row3.addView(btn("Доска") { startBoardSelect() }, lpB(1f))
+        row3.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1.4f))
+        row3.addView(btn("Закрыть") { stopSelf() }, lpB(1f))
+        content.addView(row3)
+
+        status = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            maxLines = 5
+            setPadding(dp(2), dp(2), dp(2), 0)
+        }
+        content.addView(status)
+        updateToggles()
+
+        val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        val sz = realSize()
+        menuLp = params(sz[0] - dp(16), WindowManager.LayoutParams.WRAP_CONTENT, f)
+        menuLp.x = dp(8)
+        menuLp.y = sz[1] - dp(270)
+        wm.addView(menu, menuLp)
+        makeVDraggable(handle, menuLp, menu)
+    }
+
+    private fun toggleMenu() {
+        menuShown = menuShown.not()
+        menu.visibility = if (menuShown) View.VISIBLE else View.GONE
+        arrow.showFrame = menuShown
+        arrow.invalidate()
+    }
+
+    /** Показать/скрыть весь наш UI (чтобы он не попал в скриншот). Состояние меню не теряется. */
+    private fun setUiVisible(v: Boolean) {
+        val vis = if (v) View.VISIBLE else View.INVISIBLE
+        arrow.visibility = vis
+        bubble.visibility = vis
+        menu.visibility = if (v) (if (menuShown) View.VISIBLE else View.GONE) else View.INVISIBLE
+    }
+
+    /** На время жеста наши окна не должны перехватывать нажатия по доске. */
+    private fun setTouchable(on: Boolean) {
+        val f = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        menuLp.flags = if (on) menuLp.flags and f.inv() else menuLp.flags or f
+        bubbleLp.flags = if (on) bubbleLp.flags and f.inv() else bubbleLp.flags or f
+        try {
+            wm.updateViewLayout(menu, menuLp)
+            wm.updateViewLayout(bubble, bubbleLp)
+        } catch (e: Exception) {
+        }
+    }
+
+    // ---------- выбор доски: один вертикальный свайп ----------
+
+    private fun startBoardSelect() {
+        if (selectView != null) return
+        setUiVisible(false)
+        val sv = BoardSelectView(this, { r ->
+            prefs.edit().putFloat("bl", r.left).putFloat("bt", r.top)
+                .putFloat("br", r.right).putFloat("bb", r.bottom).commit()
+            finishSelect()
+            loadBoard()
+            lastPlacement = null
+            status.text = "Доска сохранена ✓ (${r.width().toInt()}x${r.height().toInt()})"
+        }, {
+            finishSelect()
+            status.text = "Выбор отменён"
+        })
+        selectView = sv
+        val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        wm.addView(sv, params(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, f))
+    }
+
+    private fun finishSelect() {
+        selectView?.let {
+            try {
+                wm.removeView(it)
+            } catch (e: Exception) {
+            }
+        }
+        selectView = null
+        setUiVisible(true)
+    }
+
+    // ---------- захват экрана ----------
+
+    private fun startProjection(code: Int, data: Intent) {
+        try {
+            val n = buildNotif()
+            if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            else startForeground(1, n)
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val mp = mpm.getMediaProjection(code, data)
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    handler.post { releaseProjection() }
+                }
+            }, handler)
+            val sz = realSize()
+            val ir = ImageReader.newInstance(sz[0], sz[1], PixelFormat.RGBA_8888, 3)
+            // держим самый свежий кадр и время его прихода
+            ir.setOnImageAvailableListener({ r ->
+                try {
+                    val img = r.acquireLatestImage()
+                    if (img != null) {
+                        lastImg?.close()
+                        lastImg = img
+                        lastFrameAt = SystemClock.uptimeMillis()
+                    }
+                } catch (e: Exception) {
+                }
+            }, handler)
+            vdisplay = mp.createVirtualDisplay(
+                "chess_capture", sz[0], sz[1], resources.displayMetrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir.surface, null, handler
+            )
+            projection = mp
+            reader = ir
+            status.text = "Захват экрана включён. Открой Chess.com и нажми «Сканировать» в начальной позиции"
+        } catch (e: Exception) {
+            status.text = "Ошибка захвата: ${e.message}"
+        }
+    }
+
+    private fun releaseProjection() {
+        try {
+            lastImg?.close()
+        } catch (e: Exception) {
+        }
+        lastImg = null
+        try {
+            vdisplay?.release()
+        } catch (e: Exception) {
+        }
+        try {
+            reader?.close()
+        } catch (e: Exception) {
+        }
+        vdisplay = null
+        reader = null
+        projection = null
+    }
+
+    private fun requestCapture() {
+        val i = Intent(this, CaptureActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(i)
+        } catch (e: Exception) {
+            status.text = "Не удалось запросить захват: ${e.message}"
+        }
+    }
+
+    private fun viewRect(x: Int, y: Int, w: Int, h: Int) = RectF(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat())
+
+    /**
+     * fullHide=true  — прячем всё (ручное «Сканировать»).
+     * fullHide=false — прячем только то, что реально попадает в кадр доски (стрелка/рамка, и меню/кнопку, если
+     *                  они перекрывают доску): так в автоматическом режиме экран почти не мигает.
+     * Кадр берётся из памяти, на диск ничего не пишется.
+     */
+    private fun captureBoard(fullHide: Boolean, done: (Bitmap?, String) -> Unit) {
+        if (reader == null) {
+            done(null, "Захват экрана не включён.")
+            return
+        }
+        val b = RectF(arrow.board)
+        val hideAt = SystemClock.uptimeMillis()
+        var hid = false
+        if (fullHide) {
+            setUiVisible(false)
+            hid = true
+        } else {
+            if (arrow.move != null || arrow.showFrame) {
+                arrow.visibility = View.INVISIBLE
+                hid = true
+            }
+            if (RectF.intersects(b, viewRect(bubbleLp.x, bubbleLp.y, bubbleLp.width, bubbleLp.height))) {
+                bubble.visibility = View.INVISIBLE
+                hid = true
+            }
+            if (menuShown && RectF.intersects(b, viewRect(menuLp.x, menuLp.y, menu.width, menu.height))) {
+                menu.visibility = View.INVISIBLE
+                hid = true
+            }
+        }
+        val needFresh = hid
+        handler.postDelayed({ grab(b, hideAt, 0, needFresh, done) }, if (hid) 500L else 0L)
+    }
+
+    private fun grab(b: RectF, hideAt: Long, attempt: Int, needFresh: Boolean, done: (Bitmap?, String) -> Unit) {
+        val cur = lastImg
+        val fresh = cur != null && (needFresh.not() || lastFrameAt >= hideAt + 80)
+        if (fresh.not() && attempt < 10) {
+            handler.postDelayed({ grab(b, hideAt, attempt + 1, needFresh, done) }, 150L)
+            return
+        }
+        if (cur == null) {
+            setUiVisible(true)
+            done(null, "Нет кадра экрана.")
+            return
+        }
+        var bmp: Bitmap? = null
+        try {
+            val plane = cur.planes[0]
+            val bw = plane.rowStride / plane.pixelStride
+            val full = Bitmap.createBitmap(bw, cur.height, Bitmap.Config.ARGB_8888)
+            val buf = plane.buffer
+            buf.rewind()
+            full.copyPixelsFromBuffer(buf)
+            val l = b.left.toInt().coerceIn(0, cur.width - 2)
+            val t = b.top.toInt().coerceIn(0, cur.height - 2)
+            val w = b.width().toInt().coerceAtMost(cur.width - l).coerceAtLeast(1)
+            val h = b.height().toInt().coerceAtMost(cur.height - t).coerceAtLeast(1)
+            bmp = Bitmap.createBitmap(full, l, t, w, h)
+            full.recycle()
+        } catch (e: Exception) {
+            bmp = null
+        }
+        // сам кадр не закрываем: он остаётся «последним» и закроется, когда придёт новый (только RAM)
+        setUiVisible(true)
+        val out = bmp
+        if (out == null) done(null, "Ошибка скриншота.") else done(out, "")
+    }
+
+    // ---------- переключатели ----------
+
+    private fun restartTick() {
+        handler.removeCallbacks(tick)
+        if (autoCapture || autoPlay) handler.postDelayed(tick, 800L)
+    }
+
+    private fun toggleAutoCapture() {
+        autoCapture = autoCapture.not()
+        if (autoCapture) {
+            lastPlacement = null
+            if (reader == null) {
+                requestCapture()
+                status.text = "Разреши захват экрана — автозахват начнётся сам."
+            } else status.text = "Автозахват включён (каждые ~4 с)."
+        } else {
+            status.text = "Автозахват выключен."
+        }
+        restartTick()
+        updateToggles()
+    }
+
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun toggleAutoPlay() {
+        if (autoPlay.not()) {
+            if (AutoPlayer.instance == null) {
+                status.text = "Включи службу «Chess AutoPlayer» (Настройки → Специальные возможности), потом снова нажми «Автоход»."
+                openAccessibilitySettings()
+                return
+            }
+            autoPlay = true
+            lastPlacement = null
+            afterOurMove = null
+            playedFrom = null
+            retries = 0
+            arrow.move = null
+            arrow.invalidate()
+            if (reader == null) {
+                requestCapture()
+                status.text = "Автоход включён. Разреши захват экрана."
+            } else status.text = "Автоход включён: ход только когда очередь нашей стороны."
+        } else {
+            autoPlay = false
+            status.text = "Автоход выключен."
+        }
+        restartTick()
+        updateToggles()
+    }
+
+    // ---------- цикл: скриншот -> распознавание -> ход ----------
+
+    private fun autoTick() {
+        if (busy || selectView != null) return
+        if (SystemClock.uptimeMillis() - lastMoveAt < 3000L) return
+        if (hasBoard().not() || reader == null) return
+        cycle(true)
+    }
+
+    private fun scan() {
+        if (busy) return
+        cycle(false)
+    }
+
+    private fun cycle(auto: Boolean) {
+        if (busy) return
+        if (hasBoard().not()) {
+            status.text = "Сначала нажми «Доска» и проведи пальцем сверху вниз."
+            return
+        }
+        if (reader == null) {
+            if (auto.not()) {
+                requestCapture()
+                status.text = "Разреши захват экрана и снова нажми «Сканировать»."
+            }
+            return
+        }
+        busy = true
+        if (auto.not()) {
+            arrow.move = null
+            arrow.invalidate()
+            status.text = "Скриншот..."
+        }
+        captureBoard(auto.not()) { bmp, msg ->
+            if (bmp == null) {
+                busy = false
+                status.text = msg
+            } else {
+                val white = playWhite
+                Thread {
+                    val rec = BoardRecognizer.recognize(bmp, white, prefs)
+                    bmp.recycle() // распознали — скриншот сразу удаляем из памяти
+                    handler.post { onRecognized(rec, auto, white) }
+                }.start()
+            }
+        }
+    }
+
+    private fun fmt(mv: Move): String {
+        val s = mv.toString()
+        return s.substring(0, 2) + "-" + s.substring(2, 4) + (if (mv.promo != ' ') "=" + mv.promo.uppercaseChar() else "")
+    }
+
+    private fun onRecognized(rec: Rec, auto: Boolean, white: Boolean) {
+        val fen = rec.fen
+        val pos = if (fen != null) Position.fromFen(fen) else null
+        if (fen == null || pos == null) {
+            status.text = (if (auto) "Авто: " else "") + (if (fen == null) rec.msg else "Некорректный FEN: $fen")
+            busy = false
+            return
+        }
+        val placement = fen.substringBefore(' ')
+        if (auto) {
+            // мы уже сходили, соперник ещё нет
+            if (placement == afterOurMove) {
+                lastPlacement = placement
+                status.text = "Авто: жду ход соперника"
+                busy = false
+                return
+            }
+            // ход не прошёл (позиция та же, что до нашего хода) — разрешаем повтор
+            val retry = autoPlay && playedFrom != null && placement == playedFrom && retries < 2 &&
+                    SystemClock.uptimeMillis() - lastMoveAt > 5000L
+            if (placement == lastPlacement && retry.not()) {
+                busy = false
+                return
+            }
+            val ourTurn = if (placement == BoardRecognizer.START_PLACEMENT) white else rec.turn != 0
+            lastPlacement = placement
+            if (ourTurn.not()) {
+                status.text = "Авто: ход соперника"
+                arrow.move = null
+                arrow.invalidate()
+                busy = false
+                return
+            }
+        }
+        lastPlacement = placement
+        pos.white = white // ищем лучший ход для выбранной стороны
+        runEngine(pos, rec.msg + " ", placement, auto)
+    }
+
+    private fun runEngine(pos: Position, prefix: String, placement: String, auto: Boolean) {
+        status.text = prefix + "Думаю..."
+        val d = depths[level]
+        Thread {
+            val mv = Engine.best(pos, d)
+            handler.post { onBest(pos, mv, prefix, placement, auto) }
+        }.start()
+    }
+
+    private fun onBest(pos: Position, mv: Move?, prefix: String, placement: String, auto: Boolean) {
+        if (mv == null) {
+            status.text = prefix + "Нет ходов"
+            busy = false
+            return
+        }
+        if (autoPlay && auto) {
+            // стрелку не рисуем; ждём, чтобы соперник/анимация закончились, и перепроверяем позицию
+            arrow.move = null
+            arrow.invalidate()
+            status.text = "Автоход: нашёл ${fmt(mv)}, жду 2.5 с..."
+            handler.postDelayed({ confirmAndPlay(pos, mv, placement) }, 2500L)
+        } else {
+            arrow.move = mv
+            arrow.flip = playWhite.not()
+            arrow.invalidate()
+            status.text = prefix + "Лучший ход: ${fmt(mv)}"
+            busy = false
+        }
+    }
+
+    private fun confirmAndPlay(pos: Position, mv: Move, placement: String) {
+        if (autoPlay.not()) {
+            busy = false
+            return
+        }
+        captureBoard(false) { bmp, msg ->
+            if (bmp == null) {
+                busy = false
+                status.text = "Автоход: $msg"
+            } else {
+                val white = playWhite
+                Thread {
+                    val rec = BoardRecognizer.recognize(bmp, white, prefs)
+                    bmp.recycle()
+                    handler.post {
+                        val p2 = rec.fen?.substringBefore(' ')
+                        if (p2 == placement) {
+                            executeMove(pos, mv, placement)
+                        } else {
+                            status.text = "Автоход: позиция изменилась, пересчитаю"
+                            lastPlacement = null
+                            busy = false
+                        }
+                    }
+                }.start()
+            }
+        }
+    }
+
+    private fun sqCenter(sq: Int): FloatArray {
+        val f = sq % 8
+        val r = sq / 8
+        val b = arrow.board
+        val fl = playWhite.not()
+        val x = b.left + ((if (fl) 7 - f else f) + 0.5f) * b.width() / 8f
+        val y = b.top + ((if (fl) 7 - r else r) + 0.5f) * b.height() / 8f
+        return floatArrayOf(x, y)
+    }
+
+    private fun executeMove(pos: Position, mv: Move, placementBefore: String) {
+        val ap = AutoPlayer.instance
+        if (ap == null) {
+            autoPlay = false
+            restartTick()
+            updateToggles()
+            status.text = "Автоход: служба «Chess AutoPlayer» не включена (Специальные возможности)."
+            openAccessibilitySettings()
+            busy = false
+            return
+        }
+        val a = sqCenter(mv.from)
+        val b = sqCenter(mv.to)
+        setTouchable(false)
+        status.text = "Автоход: делаю ${fmt(mv)}..."
+        ap.playMove(a[0], a[1], b[0], b[1], mv.promo != ' ') { ok ->
+            handler.post {
+                setTouchable(true)
+                lastMoveAt = SystemClock.uptimeMillis()
+                if (ok) {
+                    retries = if (playedFrom == placementBefore) retries + 1 else 0
+                    playedFrom = placementBefore
+                    afterOurMove = BoardRecognizer.placement(pos.make(mv).b)
+                    status.text = "Автоход: сделан ход ${fmt(mv)}"
+                } else {
+                    status.text = "Автоход: жест не выполнен"
+                }
+                busy = false
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacksAndMessages(null)
+        releaseProjection()
+        cleanupOldScreens()
+        try {
+            projection?.stop()
+        } catch (e: Exception) {
+        }
+        for (v in listOf<View?>(arrow, bubble, menu, selectView)) {
+            try {
+                if (v != null) wm.removeView(v)
+            } catch (e: Exception) {
+            }
+        }
+    }
+}
+=== BoardRecognizer.kt
+package com.example.chessoverlay
+
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.os.SystemClock
+import android.util.Base64
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.Rect
+import org.opencv.core.Scalar
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
+import kotlin.math.abs
+
+/** turn: 1 = наш ход, 0 = ход соперника, -1 = не определили по подсветке последнего хода */
+class Rec(val fen: String?, val msg: String, val turn: Int = -1)
+
+object BoardRecognizer {
+    const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+    private const val S = 64          // размер клетки после нормализации, px
+    private const val N = 32          // размер маски-силуэта для сравнения
+    private const val MIN_SCORE = 0.38f
+    private const val VER = 7         // версия формата эталонов (эталоны из v7 остаются валидными)
+
+    private var cvReady = false
+    private val tpl = HashMap<Char, FloatArray>()
+    private var thr = -1f
+    private var lastLearnAt = 0L
+
+    private class Cell(val occupied: Boolean, val mask: FloatArray?, val bright: Float, val bg: IntArray)
+    private class LearnRes(val ok: Boolean, val msg: String)
+
+    private fun ensureCv(): Boolean {
+        if (cvReady.not()) {
+            cvReady = try {
+                OpenCVLoader.initLocal()
+            } catch (e: Throwable) {
+                false
+            }
+        }
+        return cvReady
+    }
+
+    // ---------- эталоны (SharedPreferences, хранятся постоянно) ----------
+
+    fun loadTemplates(p: SharedPreferences) {
+        tpl.clear()
+        thr = -1f
+        if (p.getInt("tpl_ver", 0) != VER) return
+        for (t in "pnbrqk") {
+            val s = p.getString("tpl_$t", null) ?: continue
+            try {
+                val by = Base64.decode(s, Base64.NO_WRAP)
+                if (by.size == N * N) tpl[t] = FloatArray(N * N) { (by[it].toInt() and 0xFF) / 255f }
+            } catch (e: Exception) {
+            }
+        }
+        thr = p.getFloat("bright_thr", -1f)
+    }
+
+    fun hasTemplates() = tpl.size == 6 && thr >= 0f
+
+    /** Расстановка фигур (первое поле FEN) из массива 8x8, индекс = (8 - ранг) * 8 + файл. */
+    fun placement(b: CharArray): String {
+        val sb = StringBuilder()
+        for (rr in 0..7) {
+            var empty = 0
+            for (ff in 0..7) {
+                val ch = b[rr * 8 + ff]
+                if (ch == '.') empty++
+                else {
+                    if (empty > 0) {
+                        sb.append(empty)
+                        empty = 0
+                    }
+                    sb.append(ch)
+                }
+            }
+            if (empty > 0) sb.append(empty)
+            if (rr < 7) sb.append('/')
+        }
+        return sb.toString()
+    }
+
+    // ---------- анализ клетки ----------
+
+    private fun med(a: ArrayList<Int>): Int {
+        a.sort()
+        return a[a.size / 2]
+    }
+
+    private fun p90(a: ArrayList<Int>): Int {
+        a.sort()
+        return a[(a.size * 9) / 10]
+    }
+
+    private fun sqName(rr: Int, ff: Int) = "" + ('a' + ff) + (8 - rr)
+
+    /** Обход тонкой рамки у краёв клетки (там гарантированно фон, а не фигура). */
+    private inline fun forRing(fn: (Int, Int) -> Unit) {
+        for (t in 1..3) {
+            for (k in 16 until 48) {
+                fn(t, k); fn(S - 1 - t, k); fn(k, t); fn(k, S - 1 - t)
+            }
+        }
+    }
+
+    /**
+     * Клетка -> (занята?, силуэт 32x32, яркость внутри силуэта, цвет фона клетки).
+     * Маска = цветовое отличие от фона ИЛИ морфологический градиент яркости, пороги адаптивные
+     * (считаются по шуму рамки клетки), поэтому тёмные темы тоже работают.
+     */
+    private fun analyze(cell: Mat): Cell {
+        val gray = Mat()
+        Imgproc.cvtColor(cell, gray, Imgproc.COLOR_BGR2GRAY)
+
+        val buf = ByteArray(S * S * 3)
+        cell.get(0, 0, buf)
+        val bs = ArrayList<Int>()
+        val gs = ArrayList<Int>()
+        val rs = ArrayList<Int>()
+        forRing { x, y ->
+            val i = (y * S + x) * 3
+            bs.add(buf[i].toInt() and 0xFF)
+            gs.add(buf[i + 1].toInt() and 0xFF)
+            rs.add(buf[i + 2].toInt() and 0xFF)
+        }
+        val medB = med(bs)
+        val medG = med(gs)
+        val medR = med(rs)
+        val bgI = intArrayOf(medB, medG, medR)
+        val bg = Scalar(medB.toDouble(), medG.toDouble(), medR.toDouble())
+        val bgMat = Mat(S, S, CvType.CV_8UC3, bg)
+        val diff = Mat()
+        Core.absdiff(cell, bgMat, diff)
+        val ch = ArrayList<Mat>()
+        Core.split(diff, ch)
+        val dmax = Mat()
+        Core.max(ch[0], ch[1], dmax)
+        Core.max(dmax, ch[2], dmax)
+
+        val blur = Mat()
+        Imgproc.GaussianBlur(gray, blur, Size(3.0, 3.0), 0.0)
+        val k3 = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
+        val k5 = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
+        val grad = Mat()
+        Imgproc.morphologyEx(blur, grad, Imgproc.MORPH_GRADIENT, k3)
+
+        val db = ByteArray(S * S)
+        val gb = ByteArray(S * S)
+        dmax.get(0, 0, db)
+        grad.get(0, 0, gb)
+        val dRing = ArrayList<Int>()
+        val gRing = ArrayList<Int>()
+        forRing { x, y ->
+            val i = y * S + x
+            dRing.add(db[i].toInt() and 0xFF)
+            gRing.add(gb[i].toInt() and 0xFF)
+        }
+        val td = (p90(dRing) * 2 + 6).coerceIn(14, 45)
+        val tg = (p90(gRing) * 2 + 8).coerceIn(10, 40)
+        val md = Mat()
+        val mg = Mat()
+        Imgproc.threshold(dmax, md, td.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+        Imgproc.threshold(grad, mg, tg.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+        val mask = Mat()
+        Core.bitwise_or(md, mg, mask)
+
+        val roi = Mat.zeros(S, S, CvType.CV_8UC1)
+        roi.submat(Rect(4, 4, S - 8, S - 8)).setTo(Scalar(255.0))
+        Core.bitwise_and(mask, roi, mask)
+
+        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, k5)
+        val contours = ArrayList<MatOfPoint>()
+        Imgproc.findContours(mask.clone(), contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        var maxA = 0.0
+        var big: MatOfPoint? = null
+        for (c in contours) {
+            val a = Imgproc.contourArea(c)
+            if (a > maxA) {
+                maxA = a
+                big = c
+            }
+        }
+        val bigC = big ?: return Cell(false, null, 0f, bgI)
+        val br = Imgproc.boundingRect(bigC)
+        if (maxA < 0.08 * S * S || br.height < 0.38 * S) return Cell(false, null, 0f, bgI)
+
+        val keep = ArrayList<MatOfPoint>()
+        for (c in contours) {
+            val a = Imgproc.contourArea(c)
+            if (a >= maxOf(60.0, 0.12 * maxA)) keep.add(c)
+        }
+        val filled = Mat.zeros(S, S, CvType.CV_8UC1)
+        Imgproc.drawContours(filled, keep, -1, Scalar(255.0), -1)
+
+        val inner = Mat()
+        Imgproc.erode(filled, inner, k5)
+        Imgproc.erode(inner, inner, k5)
+        val src = if (Core.countNonZero(inner) < 30) filled else inner
+        val bright = Core.mean(gray, src).`val`[0]
+
+        val small = Mat()
+        Imgproc.resize(filled, small, Size(N.toDouble(), N.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val sb = ByteArray(N * N)
+        small.get(0, 0, sb)
+        val m = FloatArray(N * N) { (sb[it].toInt() and 0xFF) / 255f }
+        return Cell(true, m, bright.toFloat(), bgI)
+    }
+
+    private fun softIou(a: FloatArray, b: FloatArray): Float {
+        var mn = 0f
+        var mx = 0f
+        for (i in a.indices) {
+            mn += minOf(a[i], b[i])
+            mx += maxOf(a[i], b[i])
+        }
+        return if (mx <= 0f) 0f else mn / mx
+    }
+
+    /** Скриншот доски (только в памяти) -> сетка 8x8 проанализированных клеток. */
+    private fun scanCells(bmp: Bitmap): Array<Array<Cell>> {
+        val rgba = Mat()
+        val bgr = Mat()
+        val board = Mat()
+        try {
+            Utils.bitmapToMat(bmp, rgba)
+            Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
+            Imgproc.resize(bgr, board, Size((S * 8).toDouble(), (S * 8).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            return Array(8) { r -> Array(8) { c -> analyze(board.submat(Rect(c * S, r * S, S, S)).clone()) } }
+        } finally {
+            rgba.release()
+            bgr.release()
+            board.release()
+        }
+    }
+
+    // ---------- автообучение эталонов по начальной позиции ----------
+
+    private fun startMismatch(cells: Array<Array<Cell>>, flip: Boolean): Pair<ArrayList<String>, ArrayList<String>> {
+        val startB = Position.fromFen(Position.START)?.b ?: CharArray(64) { '.' }
+        val missing = ArrayList<String>()
+        val extra = ArrayList<String>()
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val rr = if (flip) 7 - r else r
+                val ff = if (flip) 7 - c else c
+                val exp = startB[rr * 8 + ff]
+                val occ = cells[r][c].occupied
+                if (exp != '.' && occ.not()) missing.add(sqName(rr, ff))
+                if (exp == '.' && occ) extra.add(sqName(rr, ff))
+            }
+        }
+        return Pair(missing, extra)
+    }
+
+    private fun learnFromCells(cells: Array<Array<Cell>>, flip: Boolean, prefs: SharedPreferences): LearnRes {
+        val startB = Position.fromFen(Position.START)?.b ?: return LearnRes(false, "Внутренняя ошибка START")
+        val mm = startMismatch(cells, flip)
+        if (mm.first.size + mm.second.size > 4) {
+            return LearnRes(false, "Не похоже на начальную позицию. Проверь рамку («Доска») и переключатель «Играю за».")
+        }
+        val sums = HashMap<Char, FloatArray>()
+        val cnt = HashMap<Char, Int>()
+        var sw = 0f
+        var nw = 0
+        var sbk = 0f
+        var nb = 0
+        var samples = 0
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val cell = cells[r][c]
+                val m = cell.mask ?: continue
+                val rr = if (flip) 7 - r else r
+                val ff = if (flip) 7 - c else c
+                val ch = startB[rr * 8 + ff]
+                if (ch == '.') continue
+                val t = ch.lowercaseChar()
+                val acc = sums.getOrPut(t) { FloatArray(N * N) }
+                for (i in 0 until N * N) acc[i] += m[i]
+                cnt[t] = (cnt[t] ?: 0) + 1
+                samples++
+                if (ch.isUpperCase()) {
+                    sw += cell.bright; nw++
+                } else {
+                    sbk += cell.bright; nb++
+                }
+            }
+        }
+        if (sums.size < 6) {
+            val lack = "pnbrqk".filter { sums.containsKey(it).not() }
+            return LearnRes(false, "Не хватило фигур для эталонов (нет типов: $lack). Нет фигур на: " + mm.first.joinToString(","))
+        }
+        if (nw == 0 || nb == 0) return LearnRes(false, "Не вижу и белых, и чёрных фигур — проверь рамку доски.")
+        val aw = sw / nw
+        val ab = sbk / nb
+        if (aw <= ab + 8f) {
+            return LearnRes(
+                false,
+                "Белые и чёрные фигуры не различились по яркости (белые ${aw.toInt()}, чёрные ${ab.toInt()}). " +
+                        "Проверь, что «Играю за» совпадает с тем, кто стоит внизу доски."
+            )
+        }
+        val newThr = (aw + ab) / 2f
+        val ed = prefs.edit()
+        for ((t, acc) in sums) {
+            val n = cnt[t] ?: 1
+            val avg = FloatArray(N * N) { acc[it] / n }
+            tpl[t] = avg
+            val by = ByteArray(N * N) { (avg[it] * 255f).toInt().coerceIn(0, 255).toByte() }
+            ed.putString("tpl_$t", Base64.encodeToString(by, Base64.NO_WRAP))
+        }
+        thr = newThr
+        ed.putFloat("bright_thr", newThr).putInt("tpl_ver", VER).commit()
+        return LearnRes(true, "Эталоны сохранены автоматически ($samples фигур).")
+    }
+
+    // ---------- распознавание ----------
+
+    private fun medCh(l: ArrayList<IntArray>, ch: Int): Int {
+        val a = ArrayList<Int>()
+        for (x in l) a.add(x[ch])
+        return med(a)
+    }
+
+    /**
+     * Скриншот доски -> FEN. Если на доске начальная позиция — эталоны фигур сохраняются сами
+     * (первый раз, и потом обновляются при каждой новой партии, не чаще раза в 2 минуты).
+     * На диск ничего не пишется, кроме самих эталонов в SharedPreferences.
+     */
+    fun recognize(bmp: Bitmap, playWhite: Boolean, prefs: SharedPreferences): Rec {
+        if (ensureCv().not()) return Rec(null, "OpenCV не загрузился (initLocal вернул false)")
+        val flip = playWhite.not()
+        val cells = try {
+            scanCells(bmp)
+        } catch (e: Throwable) {
+            return Rec(null, "Ошибка OpenCV: ${e.message}")
+        }
+        var occ = 0
+        for (r in 0..7) for (c in 0..7) if (cells[r][c].occupied) occ++
+        if (occ == 0) return Rec(null, "Фигур не найдено: проверь рамку доски («Доска»).")
+
+        var note = ""
+        val mm = startMismatch(cells, flip)
+        val nearStart = mm.first.size + mm.second.size <= 4
+        val strictStart = mm.first.isEmpty() && mm.second.isEmpty()
+        val now = SystemClock.elapsedRealtime()
+        if ((hasTemplates().not() && nearStart) || (strictStart && now - lastLearnAt > 120000L)) {
+            val lr = learnFromCells(cells, flip, prefs)
+            if (lr.ok) {
+                note = lr.msg + " "
+                lastLearnAt = now
+            } else if (hasTemplates().not()) {
+                return Rec(null, lr.msg)
+            }
+        }
+        if (hasTemplates().not()) {
+            return Rec(null, "Эталонов ещё нет: нажми «Сканировать» в начальной позиции — они сохранятся сами.")
+        }
+
+        val grid = CharArray(64) { '.' }
+        val bad = ArrayList<String>()
+        var count = 0
+        var wk = 0
+        var bk = 0
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val cell = cells[r][c]
+                val m = cell.mask ?: continue
+                val rr = if (flip) 7 - r else r
+                val ff = if (flip) 7 - c else c
+                var best = 0f
+                var bt = 'p'
+                for ((t, tp) in tpl) {
+                    val s = softIou(tp, m)
+                    if (s > best) {
+                        best = s
+                        bt = t
+                    }
+                }
+                val name = sqName(rr, ff)
+                if (best < MIN_SCORE) {
+                    bad.add("$name (сходство ${(best * 100).toInt()}%)")
+                    continue
+                }
+                if (bt == 'p' && (rr == 0 || rr == 7)) {
+                    bad.add("$name (пешка на крайней горизонтали)")
+                    continue
+                }
+                val piece = if (cell.bright > thr) bt.uppercaseChar() else bt
+                if (piece == 'K') wk++
+                if (piece == 'k') bk++
+                grid[rr * 8 + ff] = piece
+                count++
+            }
+        }
+        if (bad.isNotEmpty()) return Rec(null, note + "Не распознаны клетки: " + bad.joinToString(", "))
+        if (wk != 1) return Rec(null, note + (if (wk == 0) "Не найден белый король." else "Найдено белых королей: $wk."))
+        if (bk != 1) return Rec(null, note + (if (bk == 0) "Не найден чёрный король." else "Найдено чёрных королей: $bk."))
+
+        // кто ходил последним: подсвеченная клетка (последний ход) с фигурой
+        val par0 = ArrayList<IntArray>()
+        val par1 = ArrayList<IntArray>()
+        for (r in 0..7) for (c in 0..7) {
+            if ((r + c) % 2 == 0) par0.add(cells[r][c].bg) else par1.add(cells[r][c].bg)
+        }
+        val m0 = intArrayOf(medCh(par0, 0), medCh(par0, 1), medCh(par0, 2))
+        val m1 = intArrayOf(medCh(par1, 0), medCh(par1, 1), medCh(par1, 2))
+        var ourHi = 0
+        var oppHi = 0
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val cell = cells[r][c]
+                if (cell.mask == null) continue
+                val ref = if ((r + c) % 2 == 0) m0 else m1
+                var d = 0
+                for (k in 0..2) d = maxOf(d, abs(cell.bg[k] - ref[k]))
+                if (d > 16) {
+                    val whitePiece = cell.bright > thr
+                    if (whitePiece == playWhite) ourHi++ else oppHi++
+                }
+            }
+        }
+        val turn = if (oppHi > 0 && ourHi == 0) 1 else if (ourHi > 0 && oppHi == 0) 0 else -1
+
+        var cs = ""
+        if (grid[60] == 'K' && grid[63] == 'R') cs += "K"
+        if (grid[60] == 'K' && grid[56] == 'R') cs += "Q"
+        if (grid[4] == 'k' && grid[7] == 'r') cs += "k"
+        if (grid[4] == 'k' && grid[0] == 'r') cs += "q"
+        if (cs.isEmpty()) cs = "-"
+        val fen = placement(grid) + (if (playWhite) " w " else " b ") + cs + " - 0 1"
+        return Rec(fen, note + "Фигур: $count.", turn)
+    }
+}
+=== ArrowView.kt
+package com.example.chessoverlay
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import android.view.MotionEvent
+import android.view.View
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
+
+/**
+ * Доска по верхней и нижней границе (проведён один вертикальный свайп).
+ * Если высота ≈ ширине экрана — доска на всю ширину (квадрат по центру свайпа).
+ * Иначе — квадрат со стороной = высоте свайпа, по центру экрана.
+ */
+fun boardFromBand(y1: Float, y2: Float, screenW: Float): RectF {
+    val top = minOf(y1, y2)
+    val bottom = maxOf(y1, y2)
+    val h = bottom - top
+    return if (h >= screenW * 0.85f) {
+        val t = ((top + bottom) / 2f - screenW / 2f).coerceAtLeast(0f)
+        RectF(0f, t, screenW, t + screenW)
+    } else {
+        val left = (screenW - h) / 2f
+        RectF(left, top, left + h, bottom)
+    }
+}
+
+/** Рисует стрелку лучшего хода поверх доски. flip=true — доска перевёрнута (играем за чёрных). */
+class ArrowView(ctx: Context) : View(ctx) {
+    var board = RectF()
+    var flip = false
+    var move: Move? = null
+    var showFrame = false
+
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(210, 0, 200, 83)
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(210, 0, 200, 83)
+        style = Paint.Style.FILL
+    }
+    private val frame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(200, 255, 193, 7)
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        pathEffect = DashPathEffect(floatArrayOf(18f, 12f), 0f)
+    }
+
+    private fun cx(sq: Int): Float {
+        val f = sq % 8
+        return board.left + ((if (flip) 7 - f else f) + 0.5f) * board.width() / 8f
+    }
+
+    private fun cy(sq: Int): Float {
+        val r = sq / 8
+        return board.top + ((if (flip) 7 - r else r) + 0.5f) * board.height() / 8f
+    }
+
+    override fun onDraw(c: Canvas) {
+        if (board.width() < 8f || board.height() < 8f) return
+        if (showFrame) c.drawRect(board, frame)
+        val m = move ?: return
+        val x1 = cx(m.from)
+        val y1 = cy(m.from)
+        val x2 = cx(m.to)
+        val y2 = cy(m.to)
+        val cell = board.width() / 8f
+        line.strokeWidth = cell * 0.16f
+        val ang = atan2((y2 - y1).toDouble(), (x2 - x1).toDouble())
+        val head = cell * 0.4f
+        val bx = x2 - (head * 0.8f * cos(ang)).toFloat()
+        val by = y2 - (head * 0.8f * sin(ang)).toFloat()
+        c.drawCircle(x1, y1, cell * 0.14f, fill)
+        c.drawLine(x1, y1, bx, by, line)
+        val p = Path()
+        p.moveTo(x2, y2)
+        val a1 = ang + Math.PI * 5 / 6
+        val a2 = ang - Math.PI * 5 / 6
+        p.lineTo(x2 + (head * cos(a1)).toFloat(), y2 + (head * sin(a1)).toFloat())
+        p.lineTo(x2 + (head * cos(a2)).toFloat(), y2 + (head * sin(a2)).toFloat())
+        p.close()
+        c.drawPath(p, fill)
+    }
+}
+
+/**
+ * Полноэкранное затемнение. Нужно провести пальцем ТОЛЬКО сверху вниз:
+ * от верхней до нижней границы доски. Ширина подгоняется под экран автоматически.
+ * Область сохраняется при отпускании пальца. «Отмена» — внизу.
+ */
+class BoardSelectView(
+    ctx: Context,
+    private val onDone: (RectF) -> Unit,
+    private val onCancel: () -> Unit
+) : View(ctx) {
+    private var y1 = 0f
+    private var y2 = 0f
+    private var drawing = false
+
+    private val frame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(255, 0, 200, 83)
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+    private val inner = Paint().apply { color = Color.argb(50, 0, 200, 83) }
+    private val bandLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(255, 255, 193, 7)
+        strokeWidth = 5f
+    }
+    private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 42f
+        textAlign = Paint.Align.CENTER
+    }
+    private val cancelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(230, 200, 50, 50) }
+    private val cancelRect = RectF()
+
+    init {
+        setBackgroundColor(Color.argb(150, 0, 0, 0))
+    }
+
+    override fun onDraw(c: Canvas) {
+        c.drawText("Проведи пальцем сверху вниз:", width / 2f, 140f, txt)
+        c.drawText("от верхнего до нижнего края доски", width / 2f, 200f, txt)
+        cancelRect.set(width / 2f - 160f, height - 220f, width / 2f + 160f, height - 120f)
+        c.drawRoundRect(cancelRect, 30f, 30f, cancelBg)
+        c.drawText("Отмена", width / 2f, height - 155f, txt)
+        if (drawing) {
+            val r = boardFromBand(y1, y2, width.toFloat())
+            c.drawRect(r, inner)
+            c.drawRect(r, frame)
+            c.drawLine(0f, y1, width.toFloat(), y1, bandLine)
+            c.drawLine(0f, y2, width.toFloat(), y2, bandLine)
+        }
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.action) {
+            MotionEvent.ACTION_DOWN -> {
+                if (cancelRect.contains(e.x, e.y)) {
+                    onCancel()
+                    return true
+                }
+                y1 = e.y
+                y2 = e.y
+                drawing = true
+                invalidate()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                y2 = e.y
+                invalidate()
+            }
+            MotionEvent.ACTION_UP -> {
+                if (drawing.not()) return true
+                y2 = e.y
+                if (abs(y2 - y1) > 150f) onDone(boardFromBand(y1, y2, width.toFloat()))
+                else {
+                    drawing = false
+                    invalidate()
+                }
+            }
+        }
+        return true
+    }
+}
+=== AutoPlayer.kt
+package com.example.chessoverlay
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Intent
+import android.graphics.Path
+import android.os.Handler
+import android.os.Looper
+import android.view.accessibility.AccessibilityEvent
+
+/**
+ * Служба специальных возможностей: делает ход на экране двумя нажатиями (откуда -> куда).
+ * Включается вручную: Настройки -> Специальные возможности -> Chess AutoPlayer.
+ */
+class AutoPlayer : AccessibilityService() {
+    companion object {
+        @Volatile
+        var instance: AutoPlayer? = null
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+    override fun onInterrupt() {}
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        instance = null
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        instance = null
+        super.onDestroy()
+    }
+
+    private fun tap(x: Float, y: Float, cb: (Boolean) -> Unit) {
+        val p = Path()
+        p.moveTo(x, y)
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0L, 70L))
+            .build()
+        val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                cb(true)
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                cb(false)
+            }
+        }, null)
+        if (ok.not()) cb(false)
+    }
+
+    /** Нажать на клетку «откуда», через 250 мс на клетку «куда»; при превращении — ещё раз на «куда» (ферзь). */
+    fun playMove(x1: Float, y1: Float, x2: Float, y2: Float, promo: Boolean, cb: (Boolean) -> Unit) {
+        tap(x1, y1) { ok1 ->
+            if (ok1.not()) {
+                cb(false)
+            } else {
+                handler.postDelayed({
+                    tap(x2, y2) { ok2 ->
+                        if (ok2.not()) {
+                            cb(false)
+                        } else if (promo) {
+                            handler.postDelayed({ tap(x2, y2) { ok3 -> cb(ok3) } }, 450L)
+                        } else {
+                            cb(true)
+                        }
+                    }
+                }, 250L)
+            }
+        }
+    }
+}
+=== CaptureActivity.kt
+package com.example.chessoverlay
+
+import android.app.Activity
+import android.content.Intent
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Bundle
+
+/** Прозрачная activity: просит у системы разрешение на захват экрана и отдаёт результат в OverlayService. */
+class CaptureActivity : Activity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(mpm.createScreenCaptureIntent(), 4242)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 4242 && resultCode == RESULT_OK && data != null) {
+            val i = Intent(this, OverlayService::class.java)
+                .setAction("chess.PROJECTION")
+                .putExtra("code", resultCode)
+                .putExtra("data", data)
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        }
+        finish()
+    }
+}

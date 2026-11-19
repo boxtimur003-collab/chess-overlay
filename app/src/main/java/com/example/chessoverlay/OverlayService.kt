@@ -34,6 +34,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.File
+import java.nio.ByteBuffer
 
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
@@ -48,10 +49,15 @@ class OverlayService : Service() {
     private lateinit var btnAutoPlay: Button
     private var menuShown = false
     private var selectView: BoardSelectView? = null
-    private var level = 1 // 0 = Легкий, 1 = Средний, 2 = Сложный
     private var playWhite = true
-    private val depths = intArrayOf(1, 3, 4)
     private val handler = Handler(Looper.getMainLooper())
+
+    // уровни: 0 = Сложный (гл. 4), 1 = Очень сложный (гл. 5, 5 с), 2 = Супер сложный (гл. 6, 10 с)
+    private var level = 0
+    private val lvDepth = intArrayOf(4, 5, 6)
+    private val lvTime = longArrayOf(3000L, 5000L, 10000L)
+    // режим: 0 = Блиц, 1 = Гроссмейстер
+    private var mode = 0
 
     // захват экрана (кадры живут только в оперативной памяти)
     private var projection: MediaProjection? = null
@@ -69,10 +75,20 @@ class OverlayService : Service() {
     private var playedFrom: String? = null
     private var lastMoveAt = 0L
     private var retries = 0
+    private var verifyFails = 0
+
+    // быстрая «подпись» кадра доски: полное распознавание только когда картинка изменилась
+    private val G = 48
+    private var baseSig: IntArray? = null
+    private var pendSig: IntArray? = null
+    private var lastCaptureSig: IntArray? = null
+    private var tickDelay = 500L
+
     private val tick = object : Runnable {
         override fun run() {
+            tickDelay = 500L
             autoTick()
-            if (autoCapture || autoPlay) handler.postDelayed(this, 4000L)
+            if (autoCapture || autoPlay) handler.postDelayed(this, tickDelay)
         }
     }
 
@@ -136,7 +152,8 @@ class OverlayService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("chess_overlay", Context.MODE_PRIVATE)
         playWhite = prefs.getBoolean("playWhite", true)
-        level = prefs.getInt("level", 1).coerceIn(0, 2)
+        level = prefs.getInt("level9", 0).coerceIn(0, 2)
+        mode = prefs.getInt("mode9", 0).coerceIn(0, 1)
         cleanupOldScreens()
         BoardRecognizer.loadTemplates(prefs) // эталоны остаются после перезапуска
         buildArrow()
@@ -152,11 +169,26 @@ class OverlayService : Service() {
             prefs.getFloat("br", 0f), prefs.getFloat("bb", 0f)
         )
         arrow.flip = playWhite.not()
-        arrow.showFrame = menuShown
+        updateFrame()
+    }
+
+    /** Рамка доски показывается только когда открыто меню и автоматика выключена (иначе она попадает в кадр). */
+    private fun updateFrame() {
+        arrow.showFrame = menuShown && autoCapture.not() && autoPlay.not()
         arrow.invalidate()
     }
 
     private fun hasBoard() = arrow.board.width() > 100f && arrow.board.height() > 100f
+
+    private fun resetAuto() {
+        lastPlacement = null
+        afterOurMove = null
+        playedFrom = null
+        retries = 0
+        verifyFails = 0
+        baseSig = null
+        pendSig = null
+    }
 
     // ---------- окна ----------
 
@@ -318,7 +350,19 @@ class OverlayService : Service() {
         }
         menu.addView(content, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
-        // строка 1: цвет + сложность
+        fun rowLp(): LinearLayout.LayoutParams {
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.setMargins(0, dp(6), 0, 0)
+            return lp
+        }
+
+        fun lpB(w: Float): LinearLayout.LayoutParams {
+            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, w)
+            lp.setMargins(dp(2), 0, dp(2), 0)
+            return lp
+        }
+
+        // строка 1: цвет + режим
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row1.addView(segmented(listOf("♙ Белые", "♟ Чёрные"), if (playWhite) 0 else 1) { i ->
             playWhite = i == 0
@@ -326,42 +370,43 @@ class OverlayService : Service() {
             arrow.flip = playWhite.not()
             arrow.move = null
             arrow.invalidate()
-            lastPlacement = null
-            afterOurMove = null
-            playedFrom = null
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f))
-        row1.addView(segmented(listOf("Легкий", "Средний", "Сложный"), level) { i ->
-            level = i
-            prefs.edit().putInt("level", level).apply()
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 3f))
+            resetAuto()
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row1.addView(segmented(listOf("⚡ Блиц", "♛ Гроссмейстер"), mode) { i ->
+            mode = i
+            prefs.edit().putInt("mode9", mode).apply()
+            resetAuto()
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.5f))
         content.addView(row1)
 
-        fun lpB(w: Float): LinearLayout.LayoutParams {
-            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, w)
-            lp.setMargins(dp(2), dp(6), dp(2), dp(2))
-            return lp
-        }
+        // строка 2: сложность
+        content.addView(segmented(listOf("Сложный", "Очень сложный", "Супер сложный"), level) { i ->
+            level = i
+            prefs.edit().putInt("level9", level).apply()
+            resetAuto()
+        }, rowLp())
 
-        // строка 2: автоматика
-        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        // строка 3: автоматика
+        val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnAutoCap = btn("Автозахват: выкл") { toggleAutoCapture() }
         btnAutoPlay = btn("Автоход: выкл") { toggleAutoPlay() }
-        row2.addView(btnAutoCap, lpB(1f))
-        row2.addView(btnAutoPlay, lpB(1f))
-        content.addView(row2)
+        row3.addView(btnAutoCap, lpB(1f))
+        row3.addView(btnAutoPlay, lpB(1f))
+        content.addView(row3, rowLp())
 
-        // строка 3: основные кнопки
-        val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row3.addView(btn("Доска") { startBoardSelect() }, lpB(1f))
-        row3.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1.4f))
-        row3.addView(btn("Закрыть") { stopSelf() }, lpB(1f))
-        content.addView(row3)
+        // строка 4: основные кнопки
+        val row4 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row4.addView(btn("Доска") { startBoardSelect() }, lpB(0.9f))
+        row4.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1.3f))
+        row4.addView(btn("Сброс стрелки") { resetArrow() }, lpB(1.3f))
+        row4.addView(btn("Закрыть") { stopSelf() }, lpB(0.9f))
+        content.addView(row4, rowLp())
 
         status = TextView(this).apply {
             textSize = 11f
             setTextColor(Color.WHITE)
             maxLines = 5
-            setPadding(dp(2), dp(2), dp(2), 0)
+            setPadding(dp(2), dp(4), dp(2), 0)
         }
         content.addView(status)
         updateToggles()
@@ -371,16 +416,27 @@ class OverlayService : Service() {
         val sz = realSize()
         menuLp = params(sz[0] - dp(16), WindowManager.LayoutParams.WRAP_CONTENT, f)
         menuLp.x = dp(8)
-        menuLp.y = sz[1] - dp(270)
+        menuLp.y = sz[1] - dp(340)
         wm.addView(menu, menuLp)
         makeVDraggable(handle, menuLp, menu)
+    }
+
+    private fun resetArrow() {
+        arrow.move = null
+        arrow.invalidate()
+        status.text = "Стрелка сброшена"
+        handler.postDelayed({
+            if (busy.not()) {
+                baseSig = boardSig()
+                pendSig = null
+            }
+        }, 250L)
     }
 
     private fun toggleMenu() {
         menuShown = menuShown.not()
         menu.visibility = if (menuShown) View.VISIBLE else View.GONE
-        arrow.showFrame = menuShown
-        arrow.invalidate()
+        updateFrame()
     }
 
     /** Показать/скрыть весь наш UI (чтобы он не попал в скриншот). Состояние меню не теряется. */
@@ -413,7 +469,7 @@ class OverlayService : Service() {
                 .putFloat("br", r.right).putFloat("bb", r.bottom).commit()
             finishSelect()
             loadBoard()
-            lastPlacement = null
+            resetAuto()
             status.text = "Доска сохранена ✓ (${r.width().toInt()}x${r.height().toInt()})"
         }, {
             finishSelect()
@@ -506,11 +562,91 @@ class OverlayService : Service() {
 
     private fun viewRect(x: Int, y: Int, w: Int, h: Int) = RectF(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat())
 
+    // ---------- подпись кадра (дешёвое обнаружение изменений на доске) ----------
+
+    private fun boardSig(): IntArray? {
+        val img = lastImg ?: return null
+        if (hasBoard().not()) return null
+        return try {
+            val pl = img.planes[0]
+            val buf = pl.buffer
+            val rs = pl.rowStride
+            val ps = pl.pixelStride
+            val b = arrow.board
+            val sig = IntArray(G * G * 3)
+            for (j in 0 until G) {
+                val y = (b.top + (j + 0.5f) * b.height() / G).toInt().coerceIn(0, img.height - 1)
+                for (i in 0 until G) {
+                    val x = (b.left + (i + 0.5f) * b.width() / G).toInt().coerceIn(0, img.width - 1)
+                    val o = y * rs + x * ps
+                    val k = (j * G + i) * 3
+                    sig[k] = buf.get(o).toInt() and 255
+                    sig[k + 1] = buf.get(o + 1).toInt() and 255
+                    sig[k + 2] = buf.get(o + 2).toInt() and 255
+                }
+            }
+            sig
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun distSeg(px: Float, py: Float, x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = x2 - x1
+        val dy = y2 - y1
+        val l2 = dx * dx + dy * dy
+        var t = if (l2 <= 0f) 0f else ((px - x1) * dx + (py - y1) * dy) / l2
+        t = t.coerceIn(0f, 1f)
+        val qx = x1 + t * dx
+        val qy = y1 + t * dy
+        return Math.sqrt(((px - qx) * (px - qx) + (py - qy) * (py - qy)).toDouble()).toFloat()
+    }
+
+    /** Число сильно изменившихся точек. masked=true — не считать точки под нашим UI (кнопка/меню/стрелка). */
+    private fun sigDiff(a: IntArray, b: IntArray, masked: Boolean): Int {
+        val bd = arrow.board
+        val rects = ArrayList<RectF>()
+        var seg: FloatArray? = null
+        if (masked) {
+            rects.add(viewRect(bubbleLp.x, bubbleLp.y, bubbleLp.width, bubbleLp.height))
+            if (menuShown) rects.add(viewRect(menuLp.x, menuLp.y, menu.width, menu.height))
+            val mv = arrow.move
+            if (mv != null) {
+                val p1 = sqCenter(mv.from)
+                val p2 = sqCenter(mv.to)
+                seg = floatArrayOf(p1[0], p1[1], p2[0], p2[1])
+            }
+        }
+        val cellPx = bd.width() / 8f
+        var cnt = 0
+        for (k in 0 until G * G) {
+            if (masked) {
+                val x = bd.left + ((k % G) + 0.5f) * bd.width() / G
+                val y = bd.top + ((k / G) + 0.5f) * bd.height() / G
+                var skip = false
+                for (r in rects) {
+                    if (r.contains(x, y)) {
+                        skip = true
+                        break
+                    }
+                }
+                val sg = seg
+                if (skip.not() && sg != null && distSeg(x, y, sg[0], sg[1], sg[2], sg[3]) < cellPx * 0.6f) skip = true
+                if (skip) continue
+            }
+            val o = k * 3
+            val d = maxOf(Math.abs(a[o] - b[o]), Math.abs(a[o + 1] - b[o + 1]), Math.abs(a[o + 2] - b[o + 2]))
+            if (d > 28) cnt++
+        }
+        return cnt
+    }
+
+    private fun sigChanged(a: IntArray, b: IntArray, masked: Boolean = false): Boolean = sigDiff(a, b, masked) >= 6
+
     /**
      * fullHide=true  — прячем всё (ручное «Сканировать»).
-     * fullHide=false — прячем только то, что реально попадает в кадр доски (стрелка/рамка, и меню/кнопку, если
-     *                  они перекрывают доску): так в автоматическом режиме экран почти не мигает.
-     * Кадр берётся из памяти, на диск ничего не пишется.
+     * fullHide=false — прячем только то, что реально попадает в кадр доски (стрелка, и меню/кнопку, если
+     *                  они перекрывают доску). Кадр берётся из памяти, на диск ничего не пишется.
      */
     private fun captureBoard(fullHide: Boolean, done: (Bitmap?, String) -> Unit) {
         if (reader == null) {
@@ -538,14 +674,14 @@ class OverlayService : Service() {
             }
         }
         val needFresh = hid
-        handler.postDelayed({ grab(b, hideAt, 0, needFresh, done) }, if (hid) 500L else 0L)
+        handler.postDelayed({ grab(b, hideAt, 0, needFresh, done) }, if (hid) 150L else 0L)
     }
 
     private fun grab(b: RectF, hideAt: Long, attempt: Int, needFresh: Boolean, done: (Bitmap?, String) -> Unit) {
         val cur = lastImg
-        val fresh = cur != null && (needFresh.not() || lastFrameAt >= hideAt + 80)
-        if (fresh.not() && attempt < 10) {
-            handler.postDelayed({ grab(b, hideAt, attempt + 1, needFresh, done) }, 150L)
+        val fresh = cur != null && (needFresh.not() || lastFrameAt >= hideAt + 60)
+        if (fresh.not() && attempt < 25) {
+            handler.postDelayed({ grab(b, hideAt, attempt + 1, needFresh, done) }, 50L)
             return
         }
         if (cur == null) {
@@ -553,34 +689,42 @@ class OverlayService : Service() {
             done(null, "Нет кадра экрана.")
             return
         }
+        lastCaptureSig = boardSig()
         var bmp: Bitmap? = null
         try {
             val plane = cur.planes[0]
-            val bw = plane.rowStride / plane.pixelStride
-            val full = Bitmap.createBitmap(bw, cur.height, Bitmap.Config.ARGB_8888)
-            val buf = plane.buffer
-            buf.rewind()
-            full.copyPixelsFromBuffer(buf)
+            val rs = plane.rowStride
+            val ps = plane.pixelStride
             val l = b.left.toInt().coerceIn(0, cur.width - 2)
             val t = b.top.toInt().coerceIn(0, cur.height - 2)
             val w = b.width().toInt().coerceAtMost(cur.width - l).coerceAtLeast(1)
             val h = b.height().toInt().coerceAtMost(cur.height - t).coerceAtLeast(1)
-            bmp = Bitmap.createBitmap(full, l, t, w, h)
-            full.recycle()
+            val out = ByteArray(w * h * 4)
+            val buf = plane.buffer
+            // копируем только область доски (а не весь экран)
+            for (y in 0 until h) {
+                buf.position((t + y) * rs + l * ps)
+                buf.get(out, y * w * 4, w * 4)
+            }
+            val bm = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            bm.copyPixelsFromBuffer(ByteBuffer.wrap(out))
+            bmp = bm
         } catch (e: Exception) {
             bmp = null
         }
         // сам кадр не закрываем: он остаётся «последним» и закроется, когда придёт новый (только RAM)
         setUiVisible(true)
-        val out = bmp
-        if (out == null) done(null, "Ошибка скриншота.") else done(out, "")
+        val res = bmp
+        if (res == null) done(null, "Ошибка скриншота.") else done(res, "")
     }
 
     // ---------- переключатели ----------
 
     private fun restartTick() {
         handler.removeCallbacks(tick)
-        if (autoCapture || autoPlay) handler.postDelayed(tick, 800L)
+        baseSig = null
+        pendSig = null
+        if (autoCapture || autoPlay) handler.postDelayed(tick, 300L)
     }
 
     private fun toggleAutoCapture() {
@@ -590,10 +734,11 @@ class OverlayService : Service() {
             if (reader == null) {
                 requestCapture()
                 status.text = "Разреши захват экрана — автозахват начнётся сам."
-            } else status.text = "Автозахват включён (каждые ~4 с)."
+            } else status.text = "Автозахват включён (проверка каждые 0.5 с)."
         } else {
             status.text = "Автозахват выключен."
         }
+        updateFrame()
         restartTick()
         updateToggles()
     }
@@ -617,27 +762,54 @@ class OverlayService : Service() {
             afterOurMove = null
             playedFrom = null
             retries = 0
+            verifyFails = 0
             arrow.move = null
             arrow.invalidate()
             if (reader == null) {
                 requestCapture()
                 status.text = "Автоход включён. Разреши захват экрана."
-            } else status.text = "Автоход включён: ход только когда очередь нашей стороны."
+            } else status.text = "Автоход включён: ход сразу, как только распознан ход соперника."
         } else {
             autoPlay = false
             status.text = "Автоход выключен."
         }
+        updateFrame()
         restartTick()
         updateToggles()
     }
 
     // ---------- цикл: скриншот -> распознавание -> ход ----------
 
+    /** Тик каждые 500 мс: дешёвое сравнение кадра; тяжёлое распознавание только когда доска изменилась и успокоилась. */
     private fun autoTick() {
         if (busy || selectView != null) return
-        if (SystemClock.uptimeMillis() - lastMoveAt < 3000L) return
+        if (SystemClock.uptimeMillis() - lastMoveAt < 600L) return
         if (hasBoard().not() || reader == null) return
+        val s = boardSig() ?: return
+        val base = baseSig
+        if (base != null && sigChanged(s, base).not()) {
+            pendSig = null
+            return
+        }
+        val pend = pendSig
+        if (pend == null || sigChanged(s, pend)) {
+            pendSig = s
+            tickDelay = 150L // картинка ещё меняется (анимация хода) — перепроверим через 150 мс
+            return
+        }
+        pendSig = null
         cycle(true)
+    }
+
+    /** Конец цикла: обновляем «базовый» кадр; если пока думали, доска изменилась — сразу пересканируем. */
+    private fun endCycle() {
+        handler.postDelayed({
+            val now = boardSig()
+            val cap = lastCaptureSig
+            baseSig = if (now != null && cap != null && sigChanged(now, cap, true)) null else now
+            pendSig = null
+            busy = false
+        }, 200L)
     }
 
     private fun scan() {
@@ -684,12 +856,20 @@ class OverlayService : Service() {
         return s.substring(0, 2) + "-" + s.substring(2, 4) + (if (mv.promo != ' ') "=" + mv.promo.uppercaseChar() else "")
     }
 
+    private fun ruMoves(n: Int): String {
+        val m100 = n % 100
+        val m10 = n % 10
+        return if (m100 in 11..14) "ходов" else if (m10 == 1) "ход" else if (m10 in 2..4) "хода" else "ходов"
+    }
+
+    private fun mateText(n: Int) = "Найден мат в $n ${ruMoves(n)}!"
+
     private fun onRecognized(rec: Rec, auto: Boolean, white: Boolean) {
         val fen = rec.fen
         val pos = if (fen != null) Position.fromFen(fen) else null
         if (fen == null || pos == null) {
             status.text = (if (auto) "Авто: " else "") + (if (fen == null) rec.msg else "Некорректный FEN: $fen")
-            busy = false
+            endCycle()
             return
         }
         val placement = fen.substringBefore(' ')
@@ -698,14 +878,24 @@ class OverlayService : Service() {
             if (placement == afterOurMove) {
                 lastPlacement = placement
                 status.text = "Авто: жду ход соперника"
-                busy = false
+                endCycle()
+                return
+            }
+            if (playedFrom != null && placement != playedFrom) {
+                playedFrom = null
+                retries = 0
+            }
+            if (autoPlay && playedFrom != null && placement == playedFrom && retries >= 2) {
+                lastPlacement = placement
+                status.text = "Автоход: ход не удался 3 раза, остановил повторы"
+                endCycle()
                 return
             }
             // ход не прошёл (позиция та же, что до нашего хода) — разрешаем повтор
             val retry = autoPlay && playedFrom != null && placement == playedFrom && retries < 2 &&
-                    SystemClock.uptimeMillis() - lastMoveAt > 5000L
+                    SystemClock.uptimeMillis() - lastMoveAt > 500L
             if (placement == lastPlacement && retry.not()) {
-                busy = false
+                endCycle()
                 return
             }
             val ourTurn = if (placement == BoardRecognizer.START_PLACEMENT) white else rec.turn != 0
@@ -714,7 +904,7 @@ class OverlayService : Service() {
                 status.text = "Авто: ход соперника"
                 arrow.move = null
                 arrow.invalidate()
-                busy = false
+                endCycle()
                 return
             }
         }
@@ -724,62 +914,61 @@ class OverlayService : Service() {
     }
 
     private fun runEngine(pos: Position, prefix: String, placement: String, auto: Boolean) {
-        status.text = prefix + "Думаю..."
-        val d = depths[level]
+        val gm = mode == 1
+        val d = if (gm) maxOf(lvDepth[level], 5) else minOf(lvDepth[level], 4)
+        val t = if (gm) maxOf(lvTime[level], 5000L) else minOf(lvTime[level], 2500L)
+        status.text = prefix + (if (gm) "Думаю (гроссмейстер, до ${t / 1000} с)..." else "Думаю...")
         Thread {
-            val mv = Engine.best(pos, d)
-            handler.post { onBest(pos, mv, prefix, placement, auto) }
+            val res = try {
+                Engine.think(pos, d, t, gm)
+            } catch (e: Throwable) {
+                EngineResult(null, 0, 0, false)
+            }
+            handler.post { onBest(pos, res, prefix, placement, auto) }
         }.start()
     }
 
-    private fun onBest(pos: Position, mv: Move?, prefix: String, placement: String, auto: Boolean) {
+    private fun onBest(pos: Position, res: EngineResult, prefix: String, placement: String, auto: Boolean) {
+        val mv = res.move
         if (mv == null) {
             status.text = prefix + "Нет ходов"
-            busy = false
+            endCycle()
             return
         }
+        val mate = if (res.mateIn > 0) mateText(res.mateIn) else ""
+        val info = if (res.mateIn > 0) mate + " Ход: " + fmt(mv)
+        else "Лучший ход: ${fmt(mv)}" + (if (res.book) " (дебют)" else if (res.depth > 0) " (гл. ${res.depth})" else "")
         if (autoPlay && auto) {
-            // стрелку не рисуем; ждём, чтобы соперник/анимация закончились, и перепроверяем позицию
+            // стрелку не рисуем; ходим сразу (без пауз), после быстрой проверки, что доска не изменилась
             arrow.move = null
             arrow.invalidate()
-            status.text = "Автоход: нашёл ${fmt(mv)}, жду 2.5 с..."
-            handler.postDelayed({ confirmAndPlay(pos, mv, placement) }, 2500L)
+            status.text = "Автоход: $info"
+            playNow(pos, mv, placement, mate)
         } else {
             arrow.move = mv
             arrow.flip = playWhite.not()
             arrow.invalidate()
-            status.text = prefix + "Лучший ход: ${fmt(mv)}"
-            busy = false
+            status.text = prefix + info
+            endCycle()
         }
     }
 
-    private fun confirmAndPlay(pos: Position, mv: Move, placement: String) {
+    private fun playNow(pos: Position, mv: Move, placement: String, mate: String) {
         if (autoPlay.not()) {
-            busy = false
+            endCycle()
             return
         }
-        captureBoard(false) { bmp, msg ->
-            if (bmp == null) {
-                busy = false
-                status.text = "Автоход: $msg"
-            } else {
-                val white = playWhite
-                Thread {
-                    val rec = BoardRecognizer.recognize(bmp, white, prefs)
-                    bmp.recycle()
-                    handler.post {
-                        val p2 = rec.fen?.substringBefore(' ')
-                        if (p2 == placement) {
-                            executeMove(pos, mv, placement)
-                        } else {
-                            status.text = "Автоход: позиция изменилась, пересчитаю"
-                            lastPlacement = null
-                            busy = false
-                        }
-                    }
-                }.start()
-            }
+        val cap = lastCaptureSig
+        val now = boardSig()
+        if (cap != null && now != null && sigChanged(now, cap, true) && verifyFails < 1) {
+            verifyFails++
+            status.text = "Автоход: позиция изменилась, пересчитаю"
+            lastPlacement = null
+            endCycle()
+            return
         }
+        verifyFails = 0
+        executeMove(pos, mv, placement, mate)
     }
 
     private fun sqCenter(sq: Int): FloatArray {
@@ -792,12 +981,13 @@ class OverlayService : Service() {
         return floatArrayOf(x, y)
     }
 
-    private fun executeMove(pos: Position, mv: Move, placementBefore: String) {
+    private fun executeMove(pos: Position, mv: Move, placementBefore: String, mate: String) {
         val ap = AutoPlayer.instance
         if (ap == null) {
             autoPlay = false
             restartTick()
             updateToggles()
+            updateFrame()
             status.text = "Автоход: служба «Chess AutoPlayer» не включена (Специальные возможности)."
             openAccessibilitySettings()
             busy = false
@@ -815,11 +1005,11 @@ class OverlayService : Service() {
                     retries = if (playedFrom == placementBefore) retries + 1 else 0
                     playedFrom = placementBefore
                     afterOurMove = BoardRecognizer.placement(pos.make(mv).b)
-                    status.text = "Автоход: сделан ход ${fmt(mv)}"
+                    status.text = "Автоход: сделан ход ${fmt(mv)}" + (if (mate.isNotEmpty()) " · $mate" else "")
                 } else {
                     status.text = "Автоход: жест не выполнен"
                 }
-                busy = false
+                endCycle() // доска изменилась -> сразу следующий скан проверит, что ход прошёл
             }
         }
     }
