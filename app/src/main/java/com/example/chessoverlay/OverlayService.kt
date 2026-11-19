@@ -83,10 +83,12 @@ class OverlayService : Service() {
     private var pendSig: IntArray? = null
     private var lastCaptureSig: IntArray? = null
     private var tickDelay = 500L
+    private val scanOpts = longArrayOf(500L, 1000L, 2500L)
+    private var scanMs = 500L
 
     private val tick = object : Runnable {
         override fun run() {
-            tickDelay = 500L
+            tickDelay = scanMs
             autoTick()
             if (autoCapture || autoPlay) handler.postDelayed(this, tickDelay)
         }
@@ -154,6 +156,8 @@ class OverlayService : Service() {
         playWhite = prefs.getBoolean("playWhite", true)
         level = prefs.getInt("level9", 0).coerceIn(0, 2)
         mode = prefs.getInt("mode9", 0).coerceIn(0, 1)
+        scanMs = prefs.getLong("scanMs9", 500L)
+        if (scanOpts.contains(scanMs).not()) scanMs = 500L
         cleanupOldScreens()
         BoardRecognizer.loadTemplates(prefs) // эталоны остаются после перезапуска
         buildArrow()
@@ -387,6 +391,13 @@ class OverlayService : Service() {
         }, rowLp())
 
         // строка 3: автоматика
+        // интервал автозахвата
+        content.addView(segmented(listOf("Скрин 0.5 с", "Скрин 1 с", "Скрин 2.5 с"), scanOpts.indexOf(scanMs).coerceAtLeast(0)) { i ->
+            scanMs = scanOpts[i]
+            prefs.edit().putLong("scanMs9", scanMs).apply()
+            status.text = "Интервал автозахвата: ${scanMs / 1000.0} с"
+        }, rowLp())
+
         val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnAutoCap = btn("Автозахват: выкл") { toggleAutoCapture() }
         btnAutoPlay = btn("Автоход: выкл") { toggleAutoPlay() }
@@ -416,7 +427,7 @@ class OverlayService : Service() {
         val sz = realSize()
         menuLp = params(sz[0] - dp(16), WindowManager.LayoutParams.WRAP_CONTENT, f)
         menuLp.x = dp(8)
-        menuLp.y = sz[1] - dp(340)
+        menuLp.y = sz[1] - dp(385)
         wm.addView(menu, menuLp)
         makeVDraggable(handle, menuLp, menu)
     }
@@ -794,7 +805,7 @@ class OverlayService : Service() {
         val pend = pendSig
         if (pend == null || sigChanged(s, pend)) {
             pendSig = s
-            tickDelay = 150L // картинка ещё меняется (анимация хода) — перепроверим через 150 мс
+            tickDelay = minOf(150L, scanMs) // картинка ещё меняется (анимация хода) — перепроверим через 150 мс
             return
         }
         pendSig = null
