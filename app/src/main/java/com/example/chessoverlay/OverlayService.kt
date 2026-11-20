@@ -31,7 +31,9 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 import java.nio.ByteBuffer
@@ -47,15 +49,18 @@ class OverlayService : Service() {
     private lateinit var status: TextView
     private lateinit var btnAutoCap: Button
     private lateinit var btnAutoPlay: Button
+    private lateinit var levelBox: LinearLayout
     private var menuShown = false
     private var selectView: BoardSelectView? = null
     private var playWhite = true
     private val handler = Handler(Looper.getMainLooper())
 
-    // уровни: 0 = Сложный (гл. 4), 1 = Очень сложный (гл. 5, 5 с), 2 = Супер сложный (гл. 6, 10 с)
+    // Блиц: 3 уровня; Гроссмейстер: Легкий / Средний / Сложный
     private var level = 0
-    private val lvDepth = intArrayOf(4, 5, 6)
-    private val lvTime = longArrayOf(3000L, 5000L, 10000L)
+    private val blDepth = intArrayOf(4, 5, 6)
+    private val blTime = longArrayOf(2000L, 3500L, 5000L)
+    private val gmDepth = intArrayOf(5, 10, 15)
+    private val gmTime = longArrayOf(3000L, 8000L, 15000L)
     // режим: 0 = Блиц, 1 = Гроссмейстер
     private var mode = 0
 
@@ -154,7 +159,7 @@ class OverlayService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("chess_overlay", Context.MODE_PRIVATE)
         playWhite = prefs.getBoolean("playWhite", true)
-        level = prefs.getInt("level9", 0).coerceIn(0, 2)
+        level = prefs.getInt("level11", prefs.getInt("level9", 0)).coerceIn(0, 2)
         mode = prefs.getInt("mode9", 0).coerceIn(0, 1)
         scanMs = prefs.getLong("scanMs9", 500L)
         if (scanOpts.contains(scanMs).not()) scanMs = 500L
@@ -284,18 +289,18 @@ class OverlayService : Service() {
     private fun btn(t: String, color: String = "#FF3A3A3A", click: () -> Unit) = Button(this).apply {
         text = t
         isAllCaps = false
-        textSize = 12f
+        textSize = 10f
         setTextColor(Color.WHITE)
-        background = roundBg(Color.parseColor(color), 10)
+        background = roundBg(Color.parseColor(color), 8)
         minHeight = 0
-        minimumHeight = dp(38)
-        setPadding(dp(6), 0, dp(6), 0)
+        minimumHeight = dp(26)
+        setPadding(dp(4), 0, dp(4), 0)
         setOnClickListener { click() }
     }
 
     private fun styleToggle(b: Button, label: String, on: Boolean) {
         b.text = label + ": " + (if (on) "вкл" else "выкл")
-        b.background = roundBg(Color.parseColor(if (on) "#FF2E7D32" else "#FF3A3A3A"), 10)
+        b.background = roundBg(Color.parseColor(if (on) "#FF2E7D32" else "#FF3A3A3A"), 8)
     }
 
     private fun updateToggles() {
@@ -303,70 +308,95 @@ class OverlayService : Service() {
         styleToggle(btnAutoPlay, "Автоход", autoPlay)
     }
 
-    /** Сегментированный переключатель. */
+    /** Сегментированный переключатель (компактный). */
     private fun segmented(labels: List<String>, selected: Int, onSel: (Int) -> Unit): LinearLayout {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val tvs = ArrayList<TextView>()
         fun paint(sel: Int) {
             for ((i, tv) in tvs.withIndex()) {
-                tv.background = roundBg(Color.parseColor(if (i == sel) "#FF2E7D32" else "#FF3A3A3A"), 8)
+                tv.background = roundBg(Color.parseColor(if (i == sel) "#FF2E7D32" else "#FF3A3A3A"), 6)
             }
         }
         labels.forEachIndexed { i, t ->
             val tv = TextView(this).apply {
                 text = t
-                textSize = 12f
+                textSize = 10f
                 setTextColor(Color.WHITE)
                 gravity = Gravity.CENTER
-                setPadding(dp(2), dp(9), dp(2), dp(9))
+                setPadding(dp(2), dp(5), dp(2), dp(5))
                 setOnClickListener {
                     paint(i)
                     onSel(i)
                 }
             }
             tvs.add(tv)
-            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            lp.setMargins(dp(2), 0, dp(2), 0)
+            val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+            lp.setMargins(dp(1), 0, dp(1), 0)
             row.addView(tv, lp)
         }
         paint(selected)
         return row
     }
 
+    private fun rebuildLevels() {
+        levelBox.removeAllViews()
+        val labels = if (mode == 1) listOf("Легкий гроссмейстер", "Средний гроссмейстер", "Сложный гроссмейстер")
+        else listOf("Сложный", "Очень сложный", "Супер сложный")
+        levelBox.addView(segmented(labels, level) { i ->
+            level = i
+            prefs.edit().putInt("level11", level).apply()
+            resetAuto()
+        })
+    }
+
     private fun buildMenu() {
         menu = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = roundBg(Color.parseColor("#EE1E1E1E"), 16)
+            background = roundBg(Color.parseColor("#EE1E1E1E"), 12)
             visibility = View.GONE
         }
         val handle = TextView(this).apply {
-            text = "⋮⋮"
-            textSize = 16f
+            text = "⋮"
+            textSize = 14f
             setTextColor(Color.LTGRAY)
             gravity = Gravity.CENTER
-            background = roundBg(Color.parseColor("#FF2E2E2E"), 16)
+            background = roundBg(Color.parseColor("#FF2E2E2E"), 12)
         }
-        menu.addView(handle, LinearLayout.LayoutParams(dp(26), LinearLayout.LayoutParams.MATCH_PARENT))
+        menu.addView(handle, LinearLayout.LayoutParams(dp(20), LinearLayout.LayoutParams.MATCH_PARENT))
 
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(4), dp(3), dp(4), dp(3))
         }
-        menu.addView(content, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        scroll.addView(content, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        menu.addView(scroll, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
 
         fun rowLp(): LinearLayout.LayoutParams {
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.setMargins(0, dp(6), 0, 0)
+            lp.setMargins(0, dp(3), 0, 0)
             return lp
         }
 
         fun lpB(w: Float): LinearLayout.LayoutParams {
             val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, w)
-            lp.setMargins(dp(2), 0, dp(2), 0)
+            lp.setMargins(dp(1), 0, dp(1), 0)
             return lp
         }
 
-        // строка 1: цвет + режим
+        // статус — сверху, чтобы был виден без прокрутки
+        status = TextView(this).apply {
+            textSize = 10f
+            setTextColor(Color.WHITE)
+            maxLines = 3
+            setPadding(dp(2), 0, dp(2), dp(1))
+        }
+        content.addView(status)
+
+        // цвет + режим
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row1.addView(segmented(listOf("♙ Белые", "♟ Чёрные"), if (playWhite) 0 else 1) { i ->
             playWhite = i == 0
@@ -379,18 +409,16 @@ class OverlayService : Service() {
         row1.addView(segmented(listOf("⚡ Блиц", "♛ Гроссмейстер"), mode) { i ->
             mode = i
             prefs.edit().putInt("mode9", mode).apply()
+            rebuildLevels()
             resetAuto()
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.5f))
-        content.addView(row1)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.4f))
+        content.addView(row1, rowLp())
 
-        // строка 2: сложность
-        content.addView(segmented(listOf("Сложный", "Очень сложный", "Супер сложный"), level) { i ->
-            level = i
-            prefs.edit().putInt("level9", level).apply()
-            resetAuto()
-        }, rowLp())
+        // уровни (зависят от режима)
+        levelBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        rebuildLevels()
+        content.addView(levelBox, rowLp())
 
-        // строка 3: автоматика
         // интервал автозахвата
         content.addView(segmented(listOf("Скрин 0.5 с", "Скрин 1 с", "Скрин 2.5 с"), scanOpts.indexOf(scanMs).coerceAtLeast(0)) { i ->
             scanMs = scanOpts[i]
@@ -398,6 +426,7 @@ class OverlayService : Service() {
             status.text = "Интервал автозахвата: ${scanMs / 1000.0} с"
         }, rowLp())
 
+        // автоматика
         val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnAutoCap = btn("Автозахват: выкл") { toggleAutoCapture() }
         btnAutoPlay = btn("Автоход: выкл") { toggleAutoPlay() }
@@ -405,29 +434,26 @@ class OverlayService : Service() {
         row3.addView(btnAutoPlay, lpB(1f))
         content.addView(row3, rowLp())
 
-        // строка 4: основные кнопки
+        // основные кнопки
         val row4 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row4.addView(btn("Доска") { startBoardSelect() }, lpB(0.9f))
-        row4.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1.3f))
-        row4.addView(btn("Сброс стрелки") { resetArrow() }, lpB(1.3f))
-        row4.addView(btn("Закрыть") { stopSelf() }, lpB(0.9f))
+        row4.addView(btn("Сканировать", "#FF2E7D32") { scan() }, lpB(1.2f))
+        row4.addView(btn("Сброс стрелки") { resetArrow() }, lpB(1.2f))
         content.addView(row4, rowLp())
 
-        status = TextView(this).apply {
-            textSize = 11f
-            setTextColor(Color.WHITE)
-            maxLines = 5
-            setPadding(dp(2), dp(4), dp(2), 0)
-        }
-        content.addView(status)
+        val row5 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row5.addView(btn("Запомнить эталоны", "#FF1565C0") { learnTemplates() }, lpB(1.6f))
+        row5.addView(btn("Закрыть") { stopSelf() }, lpB(0.8f))
+        content.addView(row5, rowLp())
+
         updateToggles()
 
         val f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         val sz = realSize()
-        menuLp = params(sz[0] - dp(16), WindowManager.LayoutParams.WRAP_CONTENT, f)
+        menuLp = params(sz[0] - dp(16), dp(150), f) // фиксированная невысокая плашка, внутри — прокрутка
         menuLp.x = dp(8)
-        menuLp.y = sz[1] - dp(385)
+        menuLp.y = sz[1] - dp(190)
         wm.addView(menu, menuLp)
         makeVDraggable(handle, menuLp, menu)
     }
@@ -729,6 +755,67 @@ class OverlayService : Service() {
         if (res == null) done(null, "Ошибка скриншота.") else done(res, "")
     }
 
+    // ---------- «Запомнить эталоны» ----------
+
+    private fun restoreTemplates(old: Map<String, String?>, oldThr: Float, oldVer: Int) {
+        val ed = prefs.edit()
+        for ((k, v) in old) {
+            if (v != null) ed.putString(k, v)
+        }
+        ed.putFloat("bright_thr", oldThr).putInt("tpl_ver", oldVer).commit()
+        BoardRecognizer.loadTemplates(prefs)
+    }
+
+    /**
+     * Принудительно переобучает эталоны фигур. Нужна начальная позиция на доске (свои фигуры внизу — как в «Белые/Чёрные»).
+     * Если начальной позиции нет, прежние эталоны возвращаются обратно.
+     */
+    private fun learnTemplates() {
+        if (busy) return
+        if (hasBoard().not()) {
+            status.text = "Сначала нажми «Доска» и проведи пальцем сверху вниз."
+            return
+        }
+        if (reader == null) {
+            requestCapture()
+            status.text = "Разреши захват экрана и снова нажми «Запомнить эталоны»."
+            return
+        }
+        busy = true
+        arrow.move = null
+        arrow.invalidate()
+        status.text = "Запоминаю эталоны (нужна начальная позиция)..."
+        val old = HashMap<String, String?>()
+        for (t in "pnbrqk") old["tpl_$t"] = prefs.getString("tpl_$t", null)
+        val oldThr = prefs.getFloat("bright_thr", -1f)
+        val oldVer = prefs.getInt("tpl_ver", 0)
+        prefs.edit().remove("tpl_ver").commit()
+        BoardRecognizer.loadTemplates(prefs) // эталонов нет -> распознаватель обучится по начальной позиции
+        captureBoard(true) { bmp, msg ->
+            if (bmp == null) {
+                restoreTemplates(old, oldThr, oldVer)
+                busy = false
+                status.text = msg
+            } else {
+                val white = playWhite
+                Thread {
+                    val rec = BoardRecognizer.recognize(bmp, white, prefs)
+                    bmp.recycle()
+                    handler.post {
+                        if (BoardRecognizer.hasTemplates()) {
+                            status.text = "Эталоны запомнены ✓"
+                        } else {
+                            restoreTemplates(old, oldThr, oldVer)
+                            status.text = "Не вышло: " + rec.msg + " Прежние эталоны сохранены."
+                        }
+                        resetAuto()
+                        endCycle()
+                    }
+                }.start()
+            }
+        }
+    }
+
     // ---------- переключатели ----------
 
     private fun restartTick() {
@@ -745,7 +832,7 @@ class OverlayService : Service() {
             if (reader == null) {
                 requestCapture()
                 status.text = "Разреши захват экрана — автозахват начнётся сам."
-            } else status.text = "Автозахват включён (проверка каждые 0.5 с)."
+            } else status.text = "Автозахват включён (проверка каждые ${scanMs / 1000.0} с)."
         } else {
             status.text = "Автозахват выключен."
         }
@@ -791,7 +878,7 @@ class OverlayService : Service() {
 
     // ---------- цикл: скриншот -> распознавание -> ход ----------
 
-    /** Тик каждые 500 мс: дешёвое сравнение кадра; тяжёлое распознавание только когда доска изменилась и успокоилась. */
+    /** Тик: дешёвое сравнение кадра; тяжёлое распознавание только когда доска изменилась и успокоилась. */
     private fun autoTick() {
         if (busy || selectView != null) return
         if (SystemClock.uptimeMillis() - lastMoveAt < 600L) return
@@ -805,7 +892,7 @@ class OverlayService : Service() {
         val pend = pendSig
         if (pend == null || sigChanged(s, pend)) {
             pendSig = s
-            tickDelay = minOf(150L, scanMs) // картинка ещё меняется (анимация хода) — перепроверим через 150 мс
+            tickDelay = minOf(150L, scanMs) // картинка ещё меняется (анимация хода) — перепроверим скоро
             return
         }
         pendSig = null
@@ -926,8 +1013,8 @@ class OverlayService : Service() {
 
     private fun runEngine(pos: Position, prefix: String, placement: String, auto: Boolean) {
         val gm = mode == 1
-        val d = if (gm) maxOf(lvDepth[level], 5) else minOf(lvDepth[level], 4)
-        val t = if (gm) maxOf(lvTime[level], 5000L) else minOf(lvTime[level], 2500L)
+        val d = if (gm) gmDepth[level] else blDepth[level]
+        val t = if (gm) gmTime[level] else blTime[level]
         status.text = prefix + (if (gm) "Думаю (гроссмейстер, до ${t / 1000} с)..." else "Думаю...")
         Thread {
             val res = try {
